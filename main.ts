@@ -156,28 +156,28 @@ async function agentBinance(market: Market): Promise<AgentResult> {
   }
 }
 
-/** Agent 3: LLM Oracle — Groq → OpenRouter GPT-OSS-120B → Gemma 4 31B */
-async function agentLLM(market: Market): Promise<AgentResult> {
+/** Agent 3: LLM Oracle — receives real prices, Groq → OR GPT-OSS-120B → Gemma 4 31B */
+async function agentLLM(market: Market, liveData?: string): Promise<AgentResult> {
   const agent = "LLM Oracle";
 
-  const prompt = `You are an autonomous oracle resolving a prediction market.
+  const dataSection = liveData
+    ? "LIVE MARKET DATA (fetched right now from public APIs):\n" + liveData + "\n"
+    : "";
 
-MARKET QUESTION: "${market.question}"
-RESOLUTION RULE: "${market.resolution_rule}"
-RESOLUTION DATE: ${new Date(market.resolution_date).toISOString()}
-CATEGORY: ${market.category}
-
-Your task:
-1. Based on the question and rule, determine whether the outcome is YES or NO as of now.
-2. Use your knowledge of current events, prices, and facts.
-3. Be decisive. Respond with ONLY a JSON object in this exact format:
-{"vote": "YES", "value": "observed fact or value", "reason": "one sentence explanation"}
-
-or
-
-{"vote": "NO", "value": "observed fact or value", "reason": "one sentence explanation"}
-
-Respond with ONLY the JSON object. No other text.`;
+  const prompt = "You are an autonomous oracle for a GenLayer-inspired prediction market.\n\n" +
+    "MARKET QUESTION: \"" + market.question + "\"\n" +
+    "RESOLUTION RULE: \"" + market.resolution_rule + "\"\n" +
+    "RESOLUTION DATE: " + new Date(market.resolution_date).toISOString() + "\n" +
+    "CATEGORY: " + market.category + "\n" +
+    (dataSection ? "\n" + dataSection : "") +
+    "\nYour task:\n" +
+    "1. Use the LIVE DATA above (if provided) as ground truth — do NOT rely on training memory for prices.\n" +
+    "2. Apply the resolution rule strictly to the data.\n" +
+    "3. Be decisive. Respond with ONLY a JSON object:\n" +
+    '{"vote": "YES", "value": "observed fact", "reason": "one sentence"}\n' +
+    "or\n" +
+    '{"vote": "NO", "value": "observed fact", "reason": "one sentence"}\n' +
+    "\nRespond with ONLY the JSON object. No other text.";
 
   // 1. Try Groq (llama-3.1-8b-instant — fastest)
   if (GROQ_API_KEY) {
@@ -320,15 +320,20 @@ async function runResolution(market: Market): Promise<Market> {
   let results: AgentResult[];
 
   if (market.category === "crypto") {
-    // 3 data agents for crypto
-    const [r1, r2, r3] = await Promise.all([
+    // Run Agent 1 & 2 first to get live prices, then feed into Agent 3
+    const [r1, r2] = await Promise.all([
       agentCoinGecko(market),
       agentBinance(market),
-      agentLLM(market),
     ]);
+    // Build live data context for LLM from real API results
+    const liveData = [r1, r2]
+      .filter(r => r.vote !== "INVALID")
+      .map(r => r.agent + ": " + r.value + " (source: " + r.source + ")")
+      .join("\n");
+    const r3 = await agentLLM(market, liveData || undefined);
     results = [r1, r2, r3];
   } else {
-    // For sports/politics: 3 LLM passes (simulating independent agents)
+    // Sports/politics: LLM agents with different model prompts
     const [r1, r2, r3] = await Promise.all([
       agentLLM(market),
       agentSportsNews(market),
@@ -543,6 +548,23 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
 /* — Empty — */
 .empty{text-align:center;padding:40px;color:var(--muted)}
 .empty-ico{font-size:30px;opacity:.4;margin-bottom:6px}
+
+/* — GenLayer references — */
+.genlayer-badge{
+  font-size:10px;padding:2px 8px;border-radius:20px;text-decoration:none;
+  background:linear-gradient(90deg,rgba(168,85,247,.2),rgba(236,72,153,.2));
+  border:1px solid rgba(168,85,247,.4);color:#c084fc;white-space:nowrap;
+  transition:border-color .2s}
+.genlayer-badge:hover{border-color:#a855f7}
+.genlayer-inline{
+  font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;
+  color:var(--accent);opacity:.7;margin-left:8px}
+.genlayer-note{
+  margin-top:12px;padding:10px 14px;border-radius:8px;font-size:11px;
+  background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);
+  color:var(--muted);line-height:1.6}
+.genlayer-note a{color:var(--accent);text-decoration:none}
+.genlayer-note a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -551,6 +573,9 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
   <div class="logo">
     <h1>🔮 Prediction Oracle</h1>
     <span class="tag">Multi-Agent Consensus</span>
+    <a class="genlayer-badge" href="https://genlayer.com" target="_blank" title="Inspired by GenLayer Intelligent Contracts">
+      Powered by GenLayer concept
+    </a>
   </div>
   <div class="stats">
     <span>Markets: <b id="s-total">0</b></span>
@@ -657,14 +682,21 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
         </div>
 
         <div id="d-agents-section" style="display:none;margin-top:16px">
-          <div class="panel-title" style="margin-bottom:8px">Agent votes</div>
+          <div class="panel-title" style="margin-bottom:8px">
+            Agent votes
+            <span class="genlayer-inline">GenLayer-style: 3 independent agents → majority consensus</span>
+          </div>
           <div class="agents" id="d-agents"></div>
           <div class="consensus">
             <div>
-              <div style="font-size:12px;color:var(--muted)">Consensus</div>
+              <div style="font-size:12px;color:var(--muted)">Consensus (2 of 3)</div>
               <div style="font-size:22px;font-weight:800;margin-top:2px" id="d-consensus"></div>
             </div>
             <div id="d-payouts"></div>
+          </div>
+          <div class="genlayer-note">
+            ⚡ Agent 1 &amp; 2 fetch live data from CoinGecko &amp; Binance — Agent 3 (LLM) receives those prices as ground truth, not training memory.
+            Inspired by <a href="https://docs.genlayer.com" target="_blank">GenLayer Intelligent Contracts</a>.
           </div>
         </div>
       </div>
