@@ -164,20 +164,18 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
     ? "LIVE MARKET DATA (fetched right now from public APIs):\n" + liveData + "\n"
     : "";
 
-  const prompt = "You are an autonomous oracle for a GenLayer-inspired prediction market.\n\n" +
-    "MARKET QUESTION: \"" + market.question + "\"\n" +
-    "RESOLUTION RULE: \"" + market.resolution_rule + "\"\n" +
-    "RESOLUTION DATE: " + new Date(market.resolution_date).toISOString() + "\n" +
-    "CATEGORY: " + market.category + "\n" +
-    (dataSection ? "\n" + dataSection : "") +
-    "\nYour task:\n" +
-    "1. Use the LIVE DATA above (if provided) as ground truth — do NOT rely on training memory for prices.\n" +
-    "2. Apply the resolution rule strictly to the data.\n" +
-    "3. Be decisive. Respond with ONLY a JSON object:\n" +
-    '{"vote": "YES", "value": "observed fact", "reason": "one sentence"}\n' +
+  const prompt = "You are a strict prediction market resolver. You MUST use the live data provided below.\n\n" +
+    (dataSection ? "=== LIVE DATA (USE THIS, IGNORE YOUR TRAINING) ===\n" + dataSection + "=== END LIVE DATA ===\n\n" : "") +
+    "QUESTION: \"" + market.question + "\"\n" +
+    "RULE: \"" + market.resolution_rule + "\"\n\n" +
+    "INSTRUCTIONS:\n" +
+    "- The live data above shows the REAL current price fetched RIGHT NOW from APIs.\n" +
+    "- Apply the rule to the live data price. Do arithmetic if needed.\n" +
+    "- Your training data prices are WRONG and OUTDATED — ignore them completely.\n" +
+    "- Reply with ONLY this JSON, nothing else:\n" +
+    '{"vote":"YES","value":"price from live data","reason":"brief math explanation"}\n' +
     "or\n" +
-    '{"vote": "NO", "value": "observed fact", "reason": "one sentence"}\n' +
-    "\nRespond with ONLY the JSON object. No other text.";
+    '{"vote":"NO","value":"price from live data","reason":"brief math explanation"}';
 
   // 1. Try Groq (llama-3.1-8b-instant — fastest)
   if (GROQ_API_KEY) {
@@ -188,8 +186,8 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
         body: JSON.stringify({
           model: "llama-3.1-8b-instant",
           messages: [{ role: "user", content: prompt }],
-          max_tokens: 150,
-          temperature: 0.1,
+          max_tokens: 200,
+          temperature: 0.0,
         }),
       });
       const data = await resp.json();
@@ -210,7 +208,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
         body: JSON.stringify({
           model: OR_MODEL_1,
           messages: [{ role: "user", content: prompt }],
-          max_tokens: 150,
+          max_tokens: 200,
         }),
       });
       const data = await resp.json();
@@ -231,7 +229,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
         body: JSON.stringify({
           model: OR_MODEL_2,
           messages: [{ role: "user", content: prompt }],
-          max_tokens: 150,
+          max_tokens: 200,
         }),
       });
       const data = await resp.json();
