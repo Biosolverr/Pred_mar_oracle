@@ -1,14 +1,16 @@
 // ══════════════════════════════════════════════════════════════════
 //  Autonomous Prediction Market Oracle  ·  Deno Deploy  ·  main.ts
-//  Stack: Deno KV · Groq / GLM / OpenRouter · Free public APIs
+//  Stack: Deno KV · Groq · OpenRouter (GPT-OSS-120B + Gemma 4 31B)
 //  Flow: Create Market → Place Bets → Resolution Date → 3 Agents
 //        → Majority Consensus → Payout Winners
 // ══════════════════════════════════════════════════════════════════
 
 const GROQ_API_KEY    = Deno.env.get("GROQ_API_KEY")    ?? "";
-const GLM_API_KEY     = Deno.env.get("GLM_API_KEY")     ?? "";
 const OPENROUTER_KEY  = Deno.env.get("OPENROUTER_API_KEY")  ?? "";
 const OWNER           = Deno.env.get("OWNER_ADDRESS")   ?? "owner";
+
+const OR_MODEL_1 = "openai/gpt-oss-120b:free";
+const OR_MODEL_2 = "google/gemma-4-31b-it:free";
 
 // ─── Types ────────────────────────────────────────────────────────
 
@@ -154,7 +156,7 @@ async function agentBinance(market: Market): Promise<AgentResult> {
   }
 }
 
-/** Agent 3: LLM with web search (Groq → GLM → OpenRouter fallback) */
+/** Agent 3: LLM Oracle — Groq → OpenRouter GPT-OSS-120B → Gemma 4 31B */
 async function agentLLM(market: Market): Promise<AgentResult> {
   const agent = "LLM Oracle";
 
@@ -177,7 +179,7 @@ or
 
 Respond with ONLY the JSON object. No other text.`;
 
-  // Try Groq first
+  // 1. Try Groq (llama-3.1-8b-instant — fastest)
   if (GROQ_API_KEY) {
     try {
       const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -191,29 +193,11 @@ Respond with ONLY the JSON object. No other text.`;
         }),
       });
       const data = await resp.json();
-      return parseLLMResponse(agent, "groq/llama-3.1-8b", data?.choices?.[0]?.message?.content ?? "");
+      return parseLLMResponse(agent, "groq/llama-3.1-8b-instant", data?.choices?.[0]?.message?.content ?? "");
     } catch { /* fallthrough */ }
   }
 
-  // Try GLM (Zhipu AI)
-  if (GLM_API_KEY) {
-    try {
-      const resp = await fetch("https://open.bigmodel.cn/api/paas/v4/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GLM_API_KEY}` },
-        body: JSON.stringify({
-          model: "glm-4-flash",
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 150,
-          temperature: 0.1,
-        }),
-      });
-      const data = await resp.json();
-      return parseLLMResponse(agent, "zhipu/glm-4-flash", data?.choices?.[0]?.message?.content ?? "");
-    } catch { /* fallthrough */ }
-  }
-
-  // Try OpenRouter
+  // 2. Try OpenRouter — GPT-OSS-120B (free)
   if (OPENROUTER_KEY) {
     try {
       const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -224,13 +208,34 @@ Respond with ONLY the JSON object. No other text.`;
           "HTTP-Referer": "https://prediction-oracle.deno.dev",
         },
         body: JSON.stringify({
-          model: "meta-llama/llama-3.1-8b-instruct:free",
+          model: OR_MODEL_1,
           messages: [{ role: "user", content: prompt }],
           max_tokens: 150,
         }),
       });
       const data = await resp.json();
-      return parseLLMResponse(agent, "openrouter/llama-3.1-8b", data?.choices?.[0]?.message?.content ?? "");
+      return parseLLMResponse(agent, OR_MODEL_1, data?.choices?.[0]?.message?.content ?? "");
+    } catch { /* fallthrough */ }
+  }
+
+  // 3. Try OpenRouter — Gemma 4 31B (free)
+  if (OPENROUTER_KEY) {
+    try {
+      const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${OPENROUTER_KEY}`,
+          "HTTP-Referer": "https://prediction-oracle.deno.dev",
+        },
+        body: JSON.stringify({
+          model: OR_MODEL_2,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 150,
+        }),
+      });
+      const data = await resp.json();
+      return parseLLMResponse(agent, OR_MODEL_2, data?.choices?.[0]?.message?.content ?? "");
     } catch { /* fallthrough */ }
   }
 
