@@ -841,14 +841,14 @@ async function inspectMarket(id){
     // Agents
     if(m.agent_results&&m.agent_results.length){
       $('d-agents-section').style.display='block';
-      $('d-agents').innerHTML=m.agent_results.map(a=>`
-        <div class="agent-card voted-${a.vote.toLowerCase()}">
-          <div class="a-name">${a.agent}</div>
-          <div class="a-val">${a.value}</div>
-          <div>${pill(a.vote)}</div>
-          <div class="a-reason">${a.reason}</div>
-          <div style="font-size:10px;color:var(--muted);margin-top:6px;word-break:break-all">${a.source}</div>
-        </div>`).join('');
+      $('d-agents').innerHTML=m.agent_results.map(a=>
+        '<div class="agent-card voted-'+a.vote.toLowerCase()+'">'+
+          '<div class="a-name">'+a.agent+'</div>'+
+          '<div class="a-val">'+a.value+'</div>'+
+          '<div>'+pill(a.vote)+'</div>'+
+          '<div class="a-reason">'+a.reason+'</div>'+
+          '<div style="font-size:10px;color:var(--muted);margin-top:6px;word-break:break-all">'+a.source+'</div>'+
+        '</div>').join('');
 
       const cons=m.consensus||'?';
       $('d-consensus').innerHTML=pill(cons);
