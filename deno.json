@@ -1,0 +1,15 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --allow-read --unstable-kv --watch main.ts",
+    "start": "deno run --allow-net --allow-env --unstable-kv main.ts"
+  },
+  "lint": {
+    "include": ["main.ts"]
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "singleQuote": false
+  }
+}
