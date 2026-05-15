@@ -740,7 +740,8 @@ window.dispatchEvent(new Event('viemReady'));
   <div class="logo">
     <div class="logo-icon">🔮</div>
     <h1>Prediction Oracle</h1>
-    <span class="tag">Multi-Agent · Base Mainnet</span>
+    <span class="tag">Multi-Agent Consensus</span>
+    <a href="https://genlayer.com" target="_blank" style="font-size:11px;color:var(--accent);text-decoration:none;padding:2px 10px;border-radius:20px;border:1px solid rgba(124,58,237,.2);background:rgba(124,58,237,.06);font-weight:500;transition:border-color .2s" onmouseover="this.style.borderColor='#7c3aed'" onmouseout="this.style.borderColor='rgba(124,58,237,.2)'">Powered by GenLayer concept ↗</a>
   </div>
   <div class="stats">
     <span>Markets: <b id="s-total">0</b></span>
