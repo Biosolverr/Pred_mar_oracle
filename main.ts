@@ -38,11 +38,11 @@ interface AgentResult {
 interface Market {
   id:              number;
   creator:         string;
-  question:        string;
+  question:        string;        // e.g. "BTC > $100k by June 1?"
   description:     string;
   category:        "crypto" | "sports" | "politics" | "custom";
-  resolution_date: number;
-  resolution_rule: string;
+  resolution_date: number;        // UTC ms timestamp
+  resolution_rule: string;        // human-readable rule for agents
   yes_pool:        number;
   no_pool:         number;
   bets:            Bet[];
@@ -51,7 +51,6 @@ interface Market {
   consensus:       Outcome | null;
   resolved_at:     number;
   created_at:      number;
-  payouts?:        PayoutRecord[];
 }
 
 // ─── KV Storage ───────────────────────────────────────────────────
@@ -312,40 +311,6 @@ function calcPayout(market: Market, bettor: string): { gross: number; net: numbe
   return { gross, fee, net: gross - fee };
 }
 
-
-
-// ─── PAYOUT CALCULATION ─────────────────────────────────────────────
-
-interface PayoutRecord {
-  bettor: string;
-  position: "YES" | "NO";
-  stake: number;
-  gross: number;
-  fee: number;
-  net: number;
-}
-
-function calculateAllPayouts(market: Market): PayoutRecord[] {
-  if (!market.consensus || market.consensus === "INVALID") return [];
-  const PLATFORM_FEE = 0.02;
-  const totalPool = market.yes_pool + market.no_pool;
-  const winnerPool = market.consensus === "YES" ? market.yes_pool : market.no_pool;
-  if (winnerPool === 0) return [];
-  const bettorStakes: Record<string, number> = {};
-  for (const bet of market.bets) {
-    if (bet.position !== market.consensus) continue;
-    bettorStakes[bet.bettor] = (bettorStakes[bet.bettor] || 0) + bet.amount;
-  }
-  const payouts: PayoutRecord[] = [];
-  for (const [bettor, stake] of Object.entries(bettorStakes)) {
-    const gross = (stake / winnerPool) * totalPool;
-    const fee = gross * PLATFORM_FEE;
-    const net = gross - fee;
-    payouts.push({ bettor, position: market.consensus, stake, gross, fee, net });
-  }
-  return payouts.sort((a, b) => b.net - a.net);
-}
-
 // ─── Run Oracle Resolution ─────────────────────────────────────────
 
 async function runResolution(market: Market): Promise<Market> {
@@ -383,8 +348,6 @@ async function runResolution(market: Market): Promise<Market> {
   market.consensus     = consensus;
   market.status        = "resolved";
   market.resolved_at   = Date.now();
-
-  market.payouts = calculateAllPayouts(market);
 
   await setMarket(market);
   await addLog("resolution_complete", {
@@ -1018,7 +981,7 @@ async function inspectMarket(id){
       // Payout preview
       const totalP=(m.yes_pool+m.no_pool).toFixed(4);
       const wPool=m.consensus==='YES'?m.yes_pool:m.no_pool;
-      $('d-payouts').innerHTML='<div style="font-size:12px;color:#6b7280">Winner pool</div>'+
+      $('d-payouts').innerHTML='<div style="font-size:12px;color:var(--muted)">Winner pool</div>'+
         '<div style="font-size:15px;font-weight:700">'+wPool.toFixed(4)+' / '+totalP+' ETH</div>';
     }else{$('d-agents-section').style.display='none';}
 
@@ -1060,30 +1023,6 @@ setInterval(()=>{loadList();loadStats();loadLogs();},9000);
 
 // ─── Router ────────────────────────────────────────────────────────
 
-// ─── AUTO-RESOLUTION CRON ──────────────────────────────────────────
-
-async function autoResolveExpiredMarkets() {
-  const now = Date.now();
-  const markets = await getAllMarkets();
-  const expired = markets.filter(m => m.status === "open" && m.resolution_date <= now);
-  if (expired.length === 0) return;
-  for (const market of expired) {
-    try {
-      market.status = "locked";
-      await setMarket(market);
-      await runResolution(market);
-      await addLog("auto_resolution_success", { id: market.id, consensus: market.consensus });
-    } catch (e: any) {
-      await addLog("auto_resolution_error", { id: market.id, error: e.message });
-    }
-  }
-}
-
-Deno.cron("Auto-resolve expired markets", "*/5 * * * *", async () => {
-  console.log("[CRON] Checking for expired markets...", new Date().toISOString());
-  await autoResolveExpiredMarkets();
-});
-
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   const path = url.pathname;
@@ -1120,33 +1059,6 @@ Deno.serve(async (req) => {
   if (path === "/api/logs" && req.method === "GET") {
     const logs = await getLogs();
     return json({ logs });
-  }
-
-  // GET leaderboard
-  if (path === "/api/leaderboard" && req.method === "GET") {
-    const all = await getAllMarkets();
-    const resolved = all.filter(m => m.status === "resolved" && m.payouts);
-    const bettorStats: Record<string, { total_net: number; wins: number; markets: number }> = {};
-    for (const m of resolved) {
-      for (const p of (m.payouts || [])) {
-        if (!bettorStats[p.bettor]) bettorStats[p.bettor] = { total_net: 0, wins: 0, markets: 0 };
-        bettorStats[p.bettor].total_net += p.net;
-        bettorStats[p.bettor].wins += 1;
-        bettorStats[p.bettor].markets += 1;
-      }
-      for (const bet of m.bets) {
-        if (bet.position !== m.consensus) {
-          if (!bettorStats[bet.bettor]) bettorStats[bet.bettor] = { total_net: 0, wins: 0, markets: 0 };
-          bettorStats[bet.bettor].total_net -= bet.amount;
-          bettorStats[bet.bettor].markets += 1;
-        }
-      }
-    }
-    const leaderboard = Object.entries(bettorStats)
-      .map(([bettor, stats]) => ({ bettor, ...stats }))
-      .sort((a, b) => b.total_net - a.total_net)
-      .slice(0, 20);
-    return json({ leaderboard });
   }
 
   // GET single market
@@ -1250,7 +1162,6 @@ Deno.serve(async (req) => {
         consensus: m.consensus,
         votes: m.agent_results.map(r => r.vote),
         agent_details: m.agent_results,
-        payouts: m.payouts,
       });
     } catch (e) {
       return json({ success: false, error: e.message }, 500);
