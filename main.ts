@@ -3,7 +3,6 @@
 //  Stack: Deno KV · Groq · OpenRouter (GPT-OSS-120B + Gemma 4 31B)
 //  Flow: Create Market → Place Bets → Resolution Date → 3 Agents
 //        → Majority Consensus → Payout Winners
-//  NEW: Auto-resolution cron + Payout calculation + Winner leaderboard
 // ══════════════════════════════════════════════════════════════════
 
 const GROQ_API_KEY    = Deno.env.get("GROQ_API_KEY")    ?? "";
@@ -13,6 +12,9 @@ const OWNER           = Deno.env.get("OWNER_ADDRESS")   ?? "owner";
 const OR_MODEL_1 = "openai/gpt-oss-120b:free";
 const OR_MODEL_2 = "google/gemma-4-31b-it:free";
 
+// ─── Contract ─────────────────────────────────────────────────────
+
+
 // ─── Types ────────────────────────────────────────────────────────
 
 type MarketStatus = "open" | "locked" | "resolving" | "resolved";
@@ -21,25 +23,16 @@ type Outcome      = "YES" | "NO" | "INVALID";
 interface Bet {
   bettor:    string;
   position:  "YES" | "NO";
-  amount:    number;
+  amount:    number;        // in ETH equivalent
   placed_at: number;
 }
 
 interface AgentResult {
-  agent:    string;
-  source:   string;
-  value:    string;
+  agent:    string;         // e.g. "CoinGecko", "Binance", "LLM"
+  source:   string;        // raw url or model name
+  value:    string;        // raw fetched value (price, headline, etc.)
   vote:     Outcome;
   reason:   string;
-}
-
-interface PayoutRecord {
-  bettor: string;
-  position: "YES" | "NO";
-  stake: number;
-  gross: number;
-  fee: number;
-  net: number;
 }
 
 interface Market {
@@ -104,6 +97,7 @@ async function getLogs(): Promise<string[]> {
 
 // ─── Free Data Agents ──────────────────────────────────────────────
 
+/** Agent 1: CoinGecko (free, no key) */
 async function agentCoinGecko(market: Market): Promise<AgentResult> {
   const agent = "CoinGecko";
   const source = "https://api.coingecko.com/api/v3/simple/price";
@@ -113,6 +107,7 @@ async function agentCoinGecko(market: Market): Promise<AgentResult> {
   }
 
   try {
+    // Extract coin from question heuristic
     const q = market.question.toLowerCase();
     const coinMap: Record<string, string> = {
       btc: "bitcoin", eth: "ethereum", sol: "solana",
@@ -130,11 +125,12 @@ async function agentCoinGecko(market: Market): Promise<AgentResult> {
     const vote = evaluateRule(market.resolution_rule, price);
 
     return { agent, source: url, value: `$${price.toLocaleString()}`, vote, reason: `Price = $${price.toLocaleString()}` };
-  } catch (e: any) {
+  } catch (e) {
     return { agent, source, value: "error", vote: "INVALID", reason: `Fetch failed: ${e.message}` };
   }
 }
 
+/** Agent 2: Binance public API (free, no key) */
 async function agentBinance(market: Market): Promise<AgentResult> {
   const agent = "Binance";
   const source = "https://api.binance.com/api/v3/ticker/price";
@@ -159,11 +155,12 @@ async function agentBinance(market: Market): Promise<AgentResult> {
     const vote = evaluateRule(market.resolution_rule, price);
 
     return { agent, source: url, value: `$${price.toLocaleString()}`, vote, reason: `Price = $${price.toLocaleString()}` };
-  } catch (e: any) {
+  } catch (e) {
     return { agent, source, value: "error", vote: "INVALID", reason: `Fetch failed: ${e.message}` };
   }
 }
 
+/** Agent 3: LLM Oracle — receives real prices, Groq → OR GPT-OSS-120B → Gemma 4 31B */
 async function agentLLM(market: Market, liveData?: string): Promise<AgentResult> {
   const agent = "LLM Oracle";
 
@@ -184,6 +181,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
     "or\n" +
     '{"vote":"NO","value":"price from live data","reason":"brief math explanation"}';
 
+  // 1. Try Groq (llama-3.1-8b-instant — fastest)
   if (GROQ_API_KEY) {
     try {
       const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -201,6 +199,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
     } catch { /* fallthrough */ }
   }
 
+  // 2. Try OpenRouter — GPT-OSS-120B (free)
   if (OPENROUTER_KEY) {
     try {
       const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -221,6 +220,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
     } catch { /* fallthrough */ }
   }
 
+  // 3. Try OpenRouter — Gemma 4 31B (free)
   if (OPENROUTER_KEY) {
     try {
       const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -257,14 +257,17 @@ function parseLLMResponse(agent: string, source: string, text: string): AgentRes
   }
 }
 
+// Non-crypto agent using LLM for sports/politics
 async function agentSportsNews(market: Market): Promise<AgentResult> {
-  return await agentLLM(market);
+  return await agentLLM(market); // LLM handles these via knowledge
 }
 
 // ─── Resolution Logic ──────────────────────────────────────────────
 
+/** Evaluate a simple numeric rule like "BTC > $100000" */
 function evaluateRule(rule: string, value: number): Outcome {
   try {
+    // Match patterns: > N, >= N, < N, <= N, == N
     const m = rule.match(/(>=|<=|>|<|==)\s*\$?([\d,]+\.?\d*)/);
     if (!m) return "INVALID";
     const op  = m[1];
@@ -280,6 +283,7 @@ function evaluateRule(rule: string, value: number): Outcome {
   }
 }
 
+/** Majority vote: need 2 of 3 non-INVALID votes */
 function majorityVote(results: AgentResult[]): Outcome {
   const valid = results.filter(r => r.vote !== "INVALID");
   if (valid.length < 2) return "INVALID";
@@ -287,39 +291,12 @@ function majorityVote(results: AgentResult[]): Outcome {
   const no  = valid.filter(r => r.vote === "NO").length;
   if (yes >= 2) return "YES";
   if (no  >= 2) return "NO";
-  return "INVALID";
+  return "INVALID"; // tie
 }
 
-// ─── PAYOUT CALCULATION ─────────────────────────────────────────────
-
-function calculateAllPayouts(market: Market): PayoutRecord[] {
-  if (!market.consensus || market.consensus === "INVALID") return [];
-
-  const PLATFORM_FEE = 0.02;
-  const totalPool = market.yes_pool + market.no_pool;
-  const winnerPool = market.consensus === "YES" ? market.yes_pool : market.no_pool;
-
-  if (winnerPool === 0) return [];
-
-  const bettorStakes: Record<string, number> = {};
-  for (const bet of market.bets) {
-    if (bet.position !== market.consensus) continue;
-    bettorStakes[bet.bettor] = (bettorStakes[bet.bettor] || 0) + bet.amount;
-  }
-
-  const payouts: PayoutRecord[] = [];
-  for (const [bettor, stake] of Object.entries(bettorStakes)) {
-    const gross = (stake / winnerPool) * totalPool;
-    const fee = gross * PLATFORM_FEE;
-    const net = gross - fee;
-    payouts.push({ bettor, position: market.consensus, stake, gross, fee, net });
-  }
-
-  return payouts.sort((a, b) => b.net - a.net);
-}
-
+/** Calculate payout for a bettor */
 function calcPayout(market: Market, bettor: string): { gross: number; net: number; fee: number } {
-  const PLATFORM_FEE = 0.02;
+  const PLATFORM_FEE = 0.02; // 2%
   const totalPool = market.yes_pool + market.no_pool;
   const winnerPool = market.consensus === "YES" ? market.yes_pool : market.no_pool;
 
@@ -335,6 +312,40 @@ function calcPayout(market: Market, bettor: string): { gross: number; net: numbe
   return { gross, fee, net: gross - fee };
 }
 
+
+
+// ─── PAYOUT CALCULATION ─────────────────────────────────────────────
+
+interface PayoutRecord {
+  bettor: string;
+  position: "YES" | "NO";
+  stake: number;
+  gross: number;
+  fee: number;
+  net: number;
+}
+
+function calculateAllPayouts(market: Market): PayoutRecord[] {
+  if (!market.consensus || market.consensus === "INVALID") return [];
+  const PLATFORM_FEE = 0.02;
+  const totalPool = market.yes_pool + market.no_pool;
+  const winnerPool = market.consensus === "YES" ? market.yes_pool : market.no_pool;
+  if (winnerPool === 0) return [];
+  const bettorStakes: Record<string, number> = {};
+  for (const bet of market.bets) {
+    if (bet.position !== market.consensus) continue;
+    bettorStakes[bet.bettor] = (bettorStakes[bet.bettor] || 0) + bet.amount;
+  }
+  const payouts: PayoutRecord[] = [];
+  for (const [bettor, stake] of Object.entries(bettorStakes)) {
+    const gross = (stake / winnerPool) * totalPool;
+    const fee = gross * PLATFORM_FEE;
+    const net = gross - fee;
+    payouts.push({ bettor, position: market.consensus, stake, gross, fee, net });
+  }
+  return payouts.sort((a, b) => b.net - a.net);
+}
+
 // ─── Run Oracle Resolution ─────────────────────────────────────────
 
 async function runResolution(market: Market): Promise<Market> {
@@ -345,10 +356,12 @@ async function runResolution(market: Market): Promise<Market> {
   let results: AgentResult[];
 
   if (market.category === "crypto") {
+    // Run Agent 1 & 2 first to get live prices, then feed into Agent 3
     const [r1, r2] = await Promise.all([
       agentCoinGecko(market),
       agentBinance(market),
     ]);
+    // Build live data context for LLM from real API results
     const liveData = [r1, r2]
       .filter(r => r.vote !== "INVALID")
       .map(r => r.agent + ": " + r.value + " (source: " + r.source + ")")
@@ -356,6 +369,7 @@ async function runResolution(market: Market): Promise<Market> {
     const r3 = await agentLLM(market, liveData || undefined);
     results = [r1, r2, r3];
   } else {
+    // Sports/politics: LLM agents with different model prompts
     const [r1, r2, r3] = await Promise.all([
       agentLLM(market),
       agentSportsNews(market),
@@ -378,46 +392,10 @@ async function runResolution(market: Market): Promise<Market> {
     votes: results.map(r => r.vote),
     consensus,
     prices: results.map(r => r.value),
-    payouts: market.payouts.map(p => ({ bettor: p.bettor, net: p.net })),
   });
 
   return market;
 }
-
-// ─── AUTO-RESOLUTION CRON ──────────────────────────────────────────
-
-async function autoResolveExpiredMarkets() {
-  const now = Date.now();
-  const markets = await getAllMarkets();
-  const expired = markets.filter(m => 
-    m.status === "open" && m.resolution_date <= now
-  );
-
-  if (expired.length === 0) return;
-
-  await addLog("auto_resolution_scan", { 
-    now, 
-    expired_count: expired.length,
-    ids: expired.map(m => m.id) 
-  });
-
-  for (const market of expired) {
-    try {
-      market.status = "locked";
-      await setMarket(market);
-      await runResolution(market);
-      await addLog("auto_resolution_success", { id: market.id, consensus: market.consensus });
-    } catch (e: any) {
-      await addLog("auto_resolution_error", { id: market.id, error: e.message });
-    }
-  }
-}
-
-// Register the cron job at top level (required by Deno Deploy)
-Deno.cron("Auto-resolve expired markets", "*/5 * * * *", async () => {
-  console.log("[CRON] Checking for expired markets...", new Date().toISOString());
-  await autoResolveExpiredMarkets();
-});
 
 // ─── HTTP Helpers ──────────────────────────────────────────────────
 
@@ -660,14 +638,6 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
   display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px
 }
 
-/* — Payouts table — */
-.payout-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
-.payout-table th{text-align:left;padding:8px 10px;background:#fafafa;color:var(--muted);font-weight:600;font-size:11px;border-bottom:1px solid var(--border)}
-.payout-table td{padding:8px 10px;border-bottom:1px solid var(--border)}
-.payout-table tr:last-child td{border-bottom:none}
-.payout-table .p-net{font-weight:700;color:var(--green)}
-.payout-table .p-fee{color:var(--red);font-size:11px}
-
 /* — Logs — */
 .logs-panel{
   background:var(--card);border:1px solid var(--border);border-radius:16px;
@@ -716,18 +686,9 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
 
 /* — Divider — */
 .divider{height:1px;background:var(--border);margin:14px 0}
-
-/* — Leaderboard — */
-.leaderboard{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:var(--shadow);margin-bottom:16px}
-.leaderboard h2{font-size:15px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.lb-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border)}
-.lb-row:last-child{border-bottom:none}
-.lb-rank{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;background:var(--bg);color:var(--accent)}
-.lb-rank.top{background:linear-gradient(135deg,var(--accent),var(--accent3));color:#fff}
-.lb-name{flex:1;font-weight:600;font-size:13px}
-.lb-profit{font-weight:700;color:var(--green);font-size:13px}
-.lb-loss{font-weight:700;color:var(--red);font-size:13px}
 </style>
+<script type="module">
+</script>
 </head>
 <body>
 
@@ -736,7 +697,6 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
     <div class="logo-icon">🔮</div>
     <h1>Prediction Oracle</h1>
     <span class="tag">Multi-Agent Consensus</span>
-    <span style="font-size:11px;color:var(--accent);padding:2px 10px;border-radius:20px;border:1px solid rgba(124,58,237,.2);background:rgba(124,58,237,.06);font-weight:500">Auto-Resolve ⏰</span>
     <a href="https://genlayer.com" target="_blank" style="font-size:11px;color:var(--accent);text-decoration:none;padding:2px 10px;border-radius:20px;border:1px solid rgba(124,58,237,.2);background:rgba(124,58,237,.06);font-weight:500;transition:border-color .2s" onmouseover="this.style.borderColor='#7c3aed'" onmouseout="this.style.borderColor='rgba(124,58,237,.2)'">Powered by GenLayer concept ↗</a>
   </div>
   <div class="stats">
@@ -747,12 +707,6 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
 </div>
 
 <div class="wrap">
-
-  <!-- Leaderboard -->
-  <div class="leaderboard" id="leaderboard">
-    <h2>🏆 Leaderboard</h2>
-    <div id="lb-body"><div class="empty" style="padding:20px"><div class="empty-ico">🏆</div>No resolved markets yet</div></div>
-  </div>
 
   <!-- ─ Row 1: Action panels horizontal ─ -->
   <div class="actions-row">
@@ -812,8 +766,6 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
       <div class="divider"></div>
       <div style="font-size:11px;color:var(--muted);line-height:2">
         <div>Contract: <span style="color:var(--accent)">0xC5794C...98Da</span></div>
-        <div>Platform fee: <span style="color:var(--accent)">2%</span></div>
-        <div>Auto-resolve: <span style="color:var(--green)">Every 5 min ⏰</span></div>
       </div>
     </div>
 
@@ -869,11 +821,6 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
             <div id="d-payouts"></div>
           </div>
           <div class="agent-note">⚡ Agents 1 &amp; 2 fetch live prices from CoinGecko &amp; Binance — Agent 3 (LLM) uses those as ground truth, not training memory.</div>
-        </div>
-
-        <div id="d-payouts-section" style="display:none;margin-top:16px">
-          <div class="panel-title" style="margin-bottom:8px">💰 Payouts (2% platform fee deducted)</div>
-          <table class="payout-table" id="d-payout-table"></table>
         </div>
       </div>
 
@@ -984,7 +931,7 @@ async function resolveMarket(){
     if(d.success){
       setMsg('r-msg','✅ Consensus: '+d.consensus+' ('+d.votes.join(' / ')+')',true);
       showToast('Resolved: '+d.consensus);
-      loadList();loadStats();loadLogs();loadLeaderboard();
+      loadList();loadStats();loadLogs();
       setTimeout(()=>inspectMarket(id),400);
     }else{setMsg('r-msg','❌ '+(d.error||'Failed'),false);showToast(d.error||'Failed','err');}
   }catch(e){setMsg('r-msg','❌ '+e.message,false);}
@@ -995,11 +942,10 @@ async function resolveMarket(){
 function renderItem(m){
   const totalPool=(m.yes_pool+m.no_pool).toFixed(3);
   const rdate=new Date(m.resolution_date).toLocaleDateString();
-  const isExpired = m.status === 'open' && Date.now() > m.resolution_date;
   return '<div class="mkt-item" onclick="inspectMarket('+m.id+')">'+
     '<div class="mid">#'+m.id+'</div>'+
     '<div class="minfo">'+
-      '<div class="mq">'+m.question+(isExpired?' <span style=\'color:var(--red);font-size:11px\'>⏰ expired</span>':'')+'</div>'+
+      '<div class="mq">'+m.question+'</div>'+
       '<div class="mm">'+m.category+' · pool: '+totalPool+' ETH · resolves '+rdate+'</div>'+
     '</div>'+
     '<div class="mside">'+badge(m.status)+poolBar(m)+'</div>'+
@@ -1023,24 +969,6 @@ async function loadStats(){
     $('s-total').textContent=d.total||0;
     $('s-open').textContent=d.open||0;
     $('s-resolved').textContent=d.resolved||0;
-  }catch{}
-}
-
-async function loadLeaderboard(){
-  try{
-    const r=await fetch('/api/leaderboard');const d=await r.json();
-    const rows=d.leaderboard||[];
-    if(rows.length===0){
-      $('lb-body').innerHTML='<div class="empty" style="padding:20px"><div class="empty-ico">🏆</div>No resolved markets yet</div>';
-      return;
-    }
-    $('lb-body').innerHTML=rows.map((row,i)=>
-      '<div class="lb-row">'+
-        '<div class="lb-rank '+(i<3?'top':'')+'">'+(i+1)+'</div>'+
-        '<div class="lb-name">'+row.bettor.slice(0,16)+'</div>'+
-        '<div class="lb-'+(row.total_net>=0?'profit':'loss')+'">'+(row.total_net>=0?'+':'')+row.total_net.toFixed(4)+' ETH</div>'+
-      '</div>'
-    ).join('');
   }catch{}
 }
 
@@ -1087,25 +1015,12 @@ async function inspectMarket(id){
       const cons=m.consensus||'?';
       $('d-consensus').innerHTML=pill(cons);
 
+      // Payout preview
       const totalP=(m.yes_pool+m.no_pool).toFixed(4);
       const wPool=m.consensus==='YES'?m.yes_pool:m.no_pool;
-      $('d-payouts').innerHTML='<div style="font-size:12px;color:var(--muted)">Winner pool</div>'+
+      $('d-payouts').innerHTML='<div style="font-size:12px;color:#6b7280">Winner pool</div>'+
         '<div style="font-size:15px;font-weight:700">'+wPool.toFixed(4)+' / '+totalP+' ETH</div>';
     }else{$('d-agents-section').style.display='none';}
-
-    // Payouts table
-    if(m.payouts&&m.payouts.length){
-      $('d-payouts-section').style.display='block';
-      $('d-payout-table').innerHTML=
-        '<tr><th>Bettor</th><th>Stake</th><th>Gross</th><th>Fee (2%)</th><th>Net</th></tr>'+
-        m.payouts.map(p=>'<tr>'+
-          '<td><b>'+p.bettor.slice(0,16)+'</b></td>'+
-          '<td>'+fmtEth(p.stake)+'</td>'+
-          '<td>'+fmtEth(p.gross)+'</td>'+
-          '<td class="p-fee">-'+fmtEth(p.fee)+'</td>'+
-          '<td class="p-net">'+fmtEth(p.net)+'</td>'+
-        '</tr>').join('');
-    }else{$('d-payouts-section').style.display='none';}
 
     $('detail').scrollIntoView({behavior:'smooth',block:'nearest'});
   }catch(e){console.error(e);}
@@ -1132,17 +1047,42 @@ async function loadLogs(){
 }
 
 // ── Init ──
+// Set default resolution date to tomorrow
 const tomorrow=new Date(Date.now()+86400000);
 $('c-date').value=tomorrow.toISOString().slice(0,16);
 
-loadList();loadStats();loadLogs();loadLeaderboard();
-setInterval(()=>{loadList();loadStats();loadLogs();loadLeaderboard();},9000);
+loadList();loadStats();loadLogs();
+setInterval(()=>{loadList();loadStats();loadLogs();},9000);
 </script>
 </body>
 </html>`;
 }
 
 // ─── Router ────────────────────────────────────────────────────────
+
+// ─── AUTO-RESOLUTION CRON ──────────────────────────────────────────
+
+async function autoResolveExpiredMarkets() {
+  const now = Date.now();
+  const markets = await getAllMarkets();
+  const expired = markets.filter(m => m.status === "open" && m.resolution_date <= now);
+  if (expired.length === 0) return;
+  for (const market of expired) {
+    try {
+      market.status = "locked";
+      await setMarket(market);
+      await runResolution(market);
+      await addLog("auto_resolution_success", { id: market.id, consensus: market.consensus });
+    } catch (e: any) {
+      await addLog("auto_resolution_error", { id: market.id, error: e.message });
+    }
+  }
+}
+
+Deno.cron("Auto-resolve expired markets", "*/5 * * * *", async () => {
+  console.log("[CRON] Checking for expired markets...", new Date().toISOString());
+  await autoResolveExpiredMarkets();
+});
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
@@ -1152,6 +1092,7 @@ Deno.serve(async (req) => {
 
   // Health check
   if (path === "/health") return json({ ok: true, ts: Date.now() });
+
 
   // Frontend
   if (path === "/" || path === "") {
@@ -1181,39 +1122,30 @@ Deno.serve(async (req) => {
     return json({ logs });
   }
 
-  // GET leaderboard — aggregated payouts across all resolved markets
+  // GET leaderboard
   if (path === "/api/leaderboard" && req.method === "GET") {
     const all = await getAllMarkets();
     const resolved = all.filter(m => m.status === "resolved" && m.payouts);
-
     const bettorStats: Record<string, { total_net: number; wins: number; markets: number }> = {};
-
     for (const m of resolved) {
       for (const p of (m.payouts || [])) {
-        if (!bettorStats[p.bettor]) {
-          bettorStats[p.bettor] = { total_net: 0, wins: 0, markets: 0 };
-        }
+        if (!bettorStats[p.bettor]) bettorStats[p.bettor] = { total_net: 0, wins: 0, markets: 0 };
         bettorStats[p.bettor].total_net += p.net;
         bettorStats[p.bettor].wins += 1;
         bettorStats[p.bettor].markets += 1;
       }
-      // Also count losers (bettors who bet on wrong side)
       for (const bet of m.bets) {
         if (bet.position !== m.consensus) {
-          if (!bettorStats[bet.bettor]) {
-            bettorStats[bet.bettor] = { total_net: 0, wins: 0, markets: 0 };
-          }
-          bettorStats[bet.bettor].total_net -= bet.amount; // lose their stake
+          if (!bettorStats[bet.bettor]) bettorStats[bet.bettor] = { total_net: 0, wins: 0, markets: 0 };
+          bettorStats[bet.bettor].total_net -= bet.amount;
           bettorStats[bet.bettor].markets += 1;
         }
       }
     }
-
     const leaderboard = Object.entries(bettorStats)
       .map(([bettor, stats]) => ({ bettor, ...stats }))
       .sort((a, b) => b.total_net - a.total_net)
       .slice(0, 20);
-
     return json({ leaderboard });
   }
 
@@ -1256,7 +1188,7 @@ Deno.serve(async (req) => {
       await setMarket(market);
       await addLog("market_created", { id, creator, question, category, resDate });
       return json({ success: true, market_id: id });
-    } catch (e: any) {
+    } catch (e) {
       return json({ success: false, error: e.message }, 500);
     }
   }
@@ -1286,7 +1218,7 @@ Deno.serve(async (req) => {
       await setMarket(m);
       await addLog("bet_placed", { market_id: id, bettor, position, amount });
       return json({ success: true });
-    } catch (e: any) {
+    } catch (e) {
       return json({ success: false, error: e.message }, 500);
     }
   }
@@ -1320,7 +1252,7 @@ Deno.serve(async (req) => {
         agent_details: m.agent_results,
         payouts: m.payouts,
       });
-    } catch (e: any) {
+    } catch (e) {
       return json({ success: false, error: e.message }, 500);
     }
   }
