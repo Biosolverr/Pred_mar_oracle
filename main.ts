@@ -12,6 +12,10 @@ const OWNER           = Deno.env.get("OWNER_ADDRESS")   ?? "owner";
 const OR_MODEL_1 = "openai/gpt-oss-120b:free";
 const OR_MODEL_2 = "google/gemma-4-31b-it:free";
 
+// ─── Contract ─────────────────────────────────────────────────────
+const CONTRACT_ADDRESS = "0xC5794C686D677202474fF795847B6D82eADe98Da";
+const OWNER_PRIVATE_KEY = Deno.env.get("OWNER_PRIVATE_KEY") ?? "";
+
 // ─── Types ────────────────────────────────────────────────────────
 
 type MarketStatus = "open" | "locked" | "resolving" | "resolved";
@@ -203,7 +207,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${OPENROUTER_KEY}`,
-          "HTTP-Referer": "https://prediction-oracle.deno.dev",
+          "HTTP-Referer": "https://pre-base-market.biosolverr.deno.net",
         },
         body: JSON.stringify({
           model: OR_MODEL_1,
@@ -224,7 +228,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${OPENROUTER_KEY}`,
-          "HTTP-Referer": "https://prediction-oracle.deno.dev",
+          "HTTP-Referer": "https://pre-base-market.biosolverr.deno.net",
         },
         body: JSON.stringify({
           model: OR_MODEL_2,
@@ -354,7 +358,79 @@ async function runResolution(market: Market): Promise<Market> {
     prices: results.map(r => r.value),
   });
 
+  // Attempt onchain resolve (owner signs tx to contract)
+  const txHash = await resolveOnchain(market.id, consensus);
+  if (txHash) {
+    await addLog("onchain_resolved", { market_id: market.id, tx: txHash });
+  }
+
   return market;
+}
+
+// ─── Onchain Resolve via Viem (Deno backend signs tx) ────────────────
+
+async function resolveOnchain(marketId: number, consensus: string): Promise<string | null> {
+  if (!OWNER_PRIVATE_KEY) {
+    await addLog("onchain_skip", { reason: "No OWNER_PRIVATE_KEY set" });
+    return null;
+  }
+
+  // Outcome enum: 0=Unresolved, 1=YES, 2=NO, 3=Invalid
+  const outcomeMap: Record<string, number> = { YES: 1, NO: 2, INVALID: 3 };
+  const outcomeVal = outcomeMap[consensus] ?? 3;
+
+  const CONTRACT = "0xC5794C686D677202474fF795847B6D82eADe98Da";
+  const RPC = "https://mainnet.base.org";
+
+  try {
+    // Encode function call: resolve(uint256,uint8)
+    // Function selector: keccak256("resolve(uint256,uint8)")[0:4]
+    const selector = "0x6a791f7f"; // resolve(uint256,uint8)
+    const idHex = marketId.toString(16).padStart(64, "0");
+    const outHex = outcomeVal.toString(16).padStart(64, "0");
+    const data = selector + idHex + outHex;
+
+    // Get nonce
+    const nonceResp = await fetch(RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "eth_getTransactionCount",
+        params: [await getAddressFromKey(OWNER_PRIVATE_KEY), "latest"]
+      })
+    });
+    const nonceData = await nonceResp.json();
+    const nonce = parseInt(nonceData.result, 16);
+
+    // Get gas price
+    const gasResp = await fetch(RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_gasPrice", params: [] })
+    });
+    const gasData = await gasResp.json();
+    const gasPrice = gasData.result;
+
+    await addLog("onchain_resolve_attempt", { marketId, consensus, outcome: outcomeVal, nonce });
+
+    // Note: Full tx signing requires secp256k1 — use eth_sendRawTransaction
+    // For now log intent, return null (upgrade path: add npm:viem in Deno)
+    await addLog("onchain_resolve_note", {
+      msg: "Add OWNER_PRIVATE_KEY + viem npm import for full onchain resolve",
+      marketId,
+      outcome: outcomeVal,
+      contract: CONTRACT
+    });
+    return null;
+  } catch (e) {
+    await addLog("onchain_resolve_error", { error: e.message });
+    return null;
+  }
+}
+
+async function getAddressFromKey(_privateKey: string): Promise<string> {
+  // Placeholder — real impl needs secp256k1
+  return OWNER || "0x0000000000000000000000000000000000000000";
 }
 
 // ─── HTTP Helpers ──────────────────────────────────────────────────
@@ -382,198 +458,289 @@ function html(): string {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="base:app_id" content="6a00924bef4989446dc30c5b"/>
 <title>Prediction Market Oracle</title>
 <style>
 :root{
-  --bg:#0b0914;--surface:#120f1e;--card:#18152a;--border:#2a2545;
-  --accent:#9b72ef;--accent2:#c77dff;--text:#e4e0f0;--muted:#7a7490;
-  --green:#3ddc84;--yellow:#f0c040;--red:#f05060;--blue:#5599ff;
-  --yes:#3ddc84;--no:#f05060;--invalid:#f0c040;
+  --bg:#f8f7ff;
+  --surface:#ffffff;
+  --card:#ffffff;
+  --border:#e8e4f3;
+  --border2:#d4cef0;
+  --accent:#7c3aed;
+  --accent2:#a855f7;
+  --accent3:#ec4899;
+  --text:#1a1523;
+  --muted:#6b7280;
+  --muted2:#9ca3af;
+  --green:#16a34a;
+  --yellow:#d97706;
+  --red:#dc2626;
+  --blue:#2563eb;
+  --yes:#16a34a;
+  --no:#dc2626;
+  --invalid:#d97706;
+  --shadow:0 1px 3px rgba(0,0,0,.06),0 4px 16px rgba(124,58,237,.06);
+  --shadow-lg:0 4px 24px rgba(124,58,237,.12);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;
-     line-height:1.5;min-height:100vh;padding-bottom:200px}
+body{
+  background:var(--bg);
+  background-image:radial-gradient(ellipse 80% 60% at 50% -10%,rgba(168,85,247,.12),transparent),
+                   radial-gradient(ellipse 60% 40% at 90% 10%,rgba(236,72,153,.08),transparent),
+                   radial-gradient(ellipse 50% 30% at 10% 80%,rgba(124,58,237,.06),transparent);
+  color:var(--text);
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  line-height:1.5;min-height:100vh;padding-bottom:20px
+}
 
 /* — Header — */
-.header{background:var(--surface);border-bottom:1px solid var(--border);
-        padding:14px 24px;display:flex;align-items:center;justify-content:space-between;
-        position:sticky;top:0;z-index:100;backdrop-filter:blur(10px)}
+.header{
+  background:rgba(255,255,255,.85);
+  border-bottom:1px solid var(--border);
+  padding:0 28px;
+  height:56px;
+  display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;
+  backdrop-filter:blur(16px);
+  -webkit-backdrop-filter:blur(16px)
+}
 .logo{display:flex;align-items:center;gap:10px}
-.logo h1{font-size:18px;font-weight:700;
-          background:linear-gradient(90deg,var(--accent),var(--accent2));
-          -webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.logo .tag{font-size:11px;background:rgba(155,114,239,.15);color:var(--accent);
-           padding:2px 8px;border-radius:20px;border:1px solid rgba(155,114,239,.3)}
-.stats{display:flex;gap:20px;font-size:13px}
+.logo-icon{width:32px;height:32px;background:#0f0a1e;border-radius:8px;
+           display:flex;align-items:center;justify-content:center;font-size:16px}
+.logo h1{font-size:16px;font-weight:700;color:var(--text);letter-spacing:-.3px}
+.logo .tag{font-size:11px;background:rgba(124,58,237,.08);color:var(--accent);
+           padding:2px 10px;border-radius:20px;border:1px solid rgba(124,58,237,.2);
+           font-weight:500;letter-spacing:.2px}
+.stats{display:flex;gap:24px;font-size:13px}
 .stats span{color:var(--muted)}
-.stats b{color:var(--text)}
+.stats b{color:var(--text);font-weight:600}
 
 /* — Layout — */
-.wrap{max-width:1400px;margin:0 auto;padding:20px}
-.grid{display:grid;grid-template-columns:340px 1fr;gap:20px}
-@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.wrap{max-width:1400px;margin:0 auto;padding:20px 24px}
+.actions-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:16px}
+.main-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+@media(max-width:1100px){.actions-row{grid-template-columns:1fr 1fr}}
+@media(max-width:700px){.actions-row{grid-template-columns:1fr}.main-row{grid-template-columns:1fr}}
 
 /* — Panels — */
-.panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px}
-.panel + .panel{margin-top:16px}
-.panel-title{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;
-             color:var(--muted);margin-bottom:14px;display:flex;align-items:center;gap:6px}
-.panel-title::before{content:'';display:inline-block;width:6px;height:6px;
-                     border-radius:50%;background:var(--accent)}
+.panel{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:20px;
+  box-shadow:var(--shadow)
+}
+.panel-title{
+  font-size:11px;text-transform:uppercase;letter-spacing:1px;
+  color:var(--muted);margin-bottom:14px;
+  display:flex;align-items:center;gap:6px;font-weight:600
+}
+.panel-title::before{
+  content:'';display:inline-block;width:6px;height:6px;
+  border-radius:50%;
+  background:linear-gradient(135deg,var(--accent),var(--accent3))
+}
 
 /* — Form elements — */
 input,textarea,select{
-  width:100%;background:rgba(0,0,0,.3);border:1px solid var(--border);
-  color:var(--text);padding:10px 12px;border-radius:8px;font-size:13px;
-  margin-bottom:10px;transition:border-color .2s;font-family:inherit}
-input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);
-  box-shadow:0 0 0 3px rgba(155,114,239,.12)}
-textarea{min-height:70px;resize:vertical}
-input::placeholder,textarea::placeholder{color:#3a3555}
-label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+  width:100%;
+  background:#fafafa;
+  border:1px solid var(--border);
+  color:var(--text);
+  padding:9px 12px;
+  border-radius:8px;
+  font-size:13px;
+  margin-bottom:10px;
+  transition:border-color .15s,box-shadow .15s;
+  font-family:inherit;
+  outline:none
+}
+input:focus,textarea:focus,select:focus{
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px rgba(124,58,237,.1);
+  background:#fff
+}
+textarea{min-height:64px;resize:vertical}
+input::placeholder,textarea::placeholder{color:var(--muted2)}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:500}
 
-.btn{width:100%;background:linear-gradient(135deg,var(--accent),var(--accent2));
-     color:#fff;border:none;padding:12px;border-radius:9px;font-weight:700;
-     font-size:13px;cursor:pointer;transition:filter .2s,transform .1s;letter-spacing:.3px}
-.btn:hover{filter:brightness(1.1)}
+.btn{
+  width:100%;
+  background:#0f0a1e;
+  color:#fff;
+  border:none;
+  padding:11px 16px;
+  border-radius:10px;
+  font-weight:600;
+  font-size:13px;
+  cursor:pointer;
+  transition:background .15s,transform .1s,box-shadow .15s;
+  letter-spacing:.1px;
+  font-family:inherit
+}
+.btn:hover{background:#1e1535;box-shadow:0 4px 12px rgba(15,10,30,.2)}
 .btn:active{transform:scale(.98)}
-.btn:disabled{opacity:.4;cursor:not-allowed;filter:none}
-.btn.ghost{background:var(--border);color:var(--text)}
-.btn.ghost:hover{background:#332e55}
-.btn.small{width:auto;padding:6px 14px;font-size:12px;border-radius:7px}
-.btn.danger{background:rgba(240,80,96,.15);color:var(--red);border:1px solid rgba(240,80,96,.3)}
-.btn.danger:hover{background:rgba(240,80,96,.25)}
+.btn:disabled{opacity:.4;cursor:not-allowed;box-shadow:none}
+.btn.ghost{background:#fff;color:var(--text);border:1px solid var(--border)}
+.btn.ghost:hover{background:#f5f3ff;border-color:var(--accent2)}
+.btn.small{width:auto;padding:6px 14px;font-size:12px;border-radius:8px}
+.btn.purple{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+.btn.purple:hover{filter:brightness(1.08)}
 
-.msg{font-size:12px;margin-top:8px;padding:8px 12px;border-radius:7px}
-.msg.ok{background:rgba(61,220,132,.1);color:var(--green);border:1px solid rgba(61,220,132,.2)}
-.msg.err{background:rgba(240,80,96,.1);color:var(--red);border:1px solid rgba(240,80,96,.2)}
+.msg{font-size:12px;margin-top:8px;padding:8px 12px;border-radius:8px}
+.msg.ok{background:#f0fdf4;color:var(--green);border:1px solid #bbf7d0}
+.msg.err{background:#fff1f2;color:var(--red);border:1px solid #fecdd3}
 
 /* — Status badges — */
-.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;
-       border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.badge{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:3px 10px;border-radius:20px;
+  font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px
+}
 .badge::before{content:'';width:5px;height:5px;border-radius:50%}
-.st-open{background:rgba(85,153,255,.12);color:var(--blue)}
+.st-open{background:#eff6ff;color:var(--blue);border:1px solid #bfdbfe}
 .st-open::before{background:var(--blue)}
-.st-locked{background:rgba(240,192,64,.12);color:var(--yellow)}
+.st-locked{background:#fffbeb;color:var(--yellow);border:1px solid #fde68a}
 .st-locked::before{background:var(--yellow)}
-.st-resolving{background:rgba(155,114,239,.15);color:var(--accent2)}
-.st-resolving::before{background:var(--accent2);animation:pulse 1s infinite}
-.st-resolved{background:rgba(61,220,132,.1);color:var(--green)}
+.st-resolving{background:#f5f3ff;color:var(--accent);border:1px solid #ddd6fe}
+.st-resolving::before{background:var(--accent);animation:pulse 1s infinite}
+.st-resolved{background:#f0fdf4;color:var(--green);border:1px solid #bbf7d0}
 .st-resolved::before{background:var(--green)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
 /* — Outcome pills — */
-.pill{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;
-      border-radius:7px;font-size:11px;font-weight:700}
-.pill-yes{background:rgba(61,220,132,.12);color:var(--yes)}
-.pill-no{background:rgba(240,80,96,.12);color:var(--no)}
-.pill-invalid{background:rgba(240,192,64,.12);color:var(--invalid)}
+.pill{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:700}
+.pill-yes{background:#f0fdf4;color:var(--yes);border:1px solid #bbf7d0}
+.pill-no{background:#fff1f2;color:var(--no);border:1px solid #fecdd3}
+.pill-invalid{background:#fffbeb;color:var(--invalid);border:1px solid #fde68a}
 
 /* — Market list — */
-.mkt-list{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden}
-.mkt-item{padding:14px 18px;border-bottom:1px solid var(--border);cursor:pointer;
-           transition:background .15s;display:grid;grid-template-columns:54px 1fr auto;gap:12px;align-items:center}
-.mkt-item:hover{background:rgba(155,114,239,.06)}
+.mkt-list{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden;box-shadow:var(--shadow)}
+.mkt-item{
+  padding:14px 18px;border-bottom:1px solid var(--border);cursor:pointer;
+  transition:background .12s;
+  display:grid;grid-template-columns:48px 1fr auto;gap:12px;align-items:center
+}
+.mkt-item:hover{background:#faf8ff}
 .mkt-item:last-child{border-bottom:none}
-.mkt-item .mid{font-weight:800;color:var(--accent);font-size:15px}
+.mkt-item .mid{font-weight:800;color:var(--accent);font-size:14px;font-variant-numeric:tabular-nums}
 .mkt-item .minfo{min-width:0}
-.mkt-item .mq{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mkt-item .mm{font-size:11px;color:var(--muted);margin-top:3px}
+.mkt-item .mq{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.mkt-item .mm{font-size:11px;color:var(--muted);margin-top:2px}
 .mkt-item .mside{display:flex;flex-direction:column;align-items:flex-end;gap:5px}
-.pool-bar{display:flex;height:5px;border-radius:3px;overflow:hidden;width:80px;margin-top:2px}
-.pool-yes{background:var(--yes)}
-.pool-no{background:var(--no)}
+.pool-bar{display:flex;height:4px;border-radius:2px;overflow:hidden;width:70px}
+.pool-yes{background:#16a34a}
+.pool-no{background:#dc2626}
 
 /* — Detail panel — */
-.detail{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px}
-.detail h2{font-size:17px;margin-bottom:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.dg{display:grid;grid-template-columns:140px 1fr;gap:1px;background:var(--border);
-    border-radius:10px;overflow:hidden}
-.dg>div{padding:10px 14px;background:var(--card);font-size:13px}
-.dg .dlabel{color:var(--muted)}
-.dg .dval{word-break:break-word}
+.detail{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:var(--shadow)}
+.detail h2{font-size:16px;margin-bottom:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-weight:700}
+.dg{display:grid;grid-template-columns:140px 1fr;gap:1px;background:var(--border);border-radius:10px;overflow:hidden}
+.dg>div{padding:9px 14px;background:var(--card);font-size:13px}
+.dg .dlabel{color:var(--muted);font-weight:500}
+.dg .dval{word-break:break-word;color:var(--text)}
 
 /* — Bet builder — */
-.bet-builder{display:flex;gap:8px;margin:12px 0}
-.bet-builder .side{flex:1;display:flex;flex-direction:column;gap:6px}
-.pos-btn{padding:12px;border-radius:9px;font-weight:700;font-size:13px;cursor:pointer;
-          border:1.5px solid;transition:all .2s;text-align:center}
-.pos-yes{border-color:rgba(61,220,132,.4);color:var(--yes);background:rgba(61,220,132,.06)}
-.pos-yes.active,.pos-yes:hover{background:rgba(61,220,132,.18);border-color:var(--yes)}
-.pos-no{border-color:rgba(240,80,96,.4);color:var(--no);background:rgba(240,80,96,.06)}
-.pos-no.active,.pos-no:hover{background:rgba(240,80,96,.18);border-color:var(--no)}
+.bet-builder{display:flex;gap:8px;margin:10px 0}
+.pos-btn{
+  flex:1;padding:11px;border-radius:10px;font-weight:700;font-size:13px;
+  cursor:pointer;border:1.5px solid;transition:all .15s;text-align:center
+}
+.pos-yes{border-color:#bbf7d0;color:var(--yes);background:#f0fdf4}
+.pos-yes.active,.pos-yes:hover{background:#dcfce7;border-color:var(--yes)}
+.pos-no{border-color:#fecdd3;color:var(--no);background:#fff1f2}
+.pos-no.active,.pos-no:hover{background:#ffe4e6;border-color:var(--no)}
 
 /* — Agent cards — */
-.agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:10px}
-.agent-card{background:rgba(0,0,0,.3);border:1px solid var(--border);border-radius:10px;padding:12px}
-.agent-card .a-name{font-size:11px;text-transform:uppercase;color:var(--muted);letter-spacing:.8px}
-.agent-card .a-val{font-size:16px;font-weight:700;margin:4px 0}
-.agent-card .a-reason{font-size:11px;color:var(--muted);line-height:1.4}
-.agent-card.voted-yes{border-color:rgba(61,220,132,.35)}
-.agent-card.voted-no{border-color:rgba(240,80,96,.35)}
-.agent-card.voted-invalid{border-color:rgba(240,192,64,.25)}
+.agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:10px}
+.agent-card{
+  background:#fafafa;border:1px solid var(--border);
+  border-radius:12px;padding:14px;transition:box-shadow .15s
+}
+.agent-card:hover{box-shadow:var(--shadow)}
+.agent-card .a-name{font-size:10px;text-transform:uppercase;color:var(--muted);letter-spacing:1px;font-weight:600}
+.agent-card .a-val{font-size:18px;font-weight:800;margin:6px 0 4px;color:var(--text)}
+.agent-card .a-reason{font-size:11px;color:var(--muted);line-height:1.5;margin-top:6px}
+.agent-card .a-src{font-size:10px;color:var(--muted2);margin-top:6px;word-break:break-all}
+.agent-card.voted-yes{border-color:#bbf7d0;background:#f0fdf4}
+.agent-card.voted-no{border-color:#fecdd3;background:#fff1f2}
+.agent-card.voted-invalid{border-color:#fde68a;background:#fffbeb}
 
 /* — Consensus box — */
-.consensus{margin-top:14px;padding:14px;border-radius:10px;
-           background:rgba(155,114,239,.07);border:1px solid rgba(155,114,239,.2);
-           display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.consensus{
+  margin-top:14px;padding:16px;border-radius:12px;
+  background:linear-gradient(135deg,rgba(124,58,237,.04),rgba(236,72,153,.04));
+  border:1px solid rgba(124,58,237,.15);
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px
+}
 
 /* — Logs — */
-.logs-panel{position:fixed;bottom:0;left:0;right:0;height:175px;background:#060410;
-            border-top:1px solid var(--border);display:flex;flex-direction:column;z-index:90}
-.logs-header{padding:7px 16px;background:var(--surface);border-bottom:1px solid var(--border);
-             display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)}
-.logs-body{flex:1;overflow-y:auto;padding:6px 16px;font-family:'Cascadia Code','SF Mono',monospace;font-size:11px}
-.log-row{display:flex;gap:10px;padding:2px 0;border-bottom:1px solid #0c0920}
+.logs-panel{
+  background:var(--card);border:1px solid var(--border);border-radius:16px;
+  display:flex;flex-direction:column;max-height:200px;
+  margin:0 0 20px;box-shadow:var(--shadow)
+}
+.logs-header{
+  padding:10px 16px;border-bottom:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center;
+  font-size:12px;color:var(--muted);border-radius:16px 16px 0 0;font-weight:600
+}
+.logs-body{flex:1;overflow-y:auto;padding:6px 16px;font-family:'SF Mono','Cascadia Code',monospace;font-size:11px}
+.log-row{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid #f3f0fa}
 .log-t{color:var(--accent);opacity:.7;white-space:nowrap}
 .log-a{color:var(--blue);font-weight:600;white-space:nowrap;min-width:120px}
 .log-d{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* — Toast — */
-.toast{position:fixed;top:18px;right:18px;background:var(--card);border:1px solid var(--border);
-       padding:13px 18px;border-radius:11px;box-shadow:0 12px 40px rgba(0,0,0,.6);
-       z-index:200;transform:translateX(160%);transition:transform .3s;max-width:300px;font-size:13px}
+.toast{
+  position:fixed;top:16px;right:16px;
+  background:#fff;border:1px solid var(--border);
+  padding:12px 18px;border-radius:12px;
+  box-shadow:0 8px 32px rgba(0,0,0,.12);
+  z-index:200;transform:translateX(160%);transition:transform .3s;
+  max-width:300px;font-size:13px;color:var(--text)
+}
 .toast.show{transform:translateX(0)}
-.toast.ok{border-color:rgba(61,220,132,.5)}
-.toast.err{border-color:rgba(240,80,96,.5)}
+.toast.ok{border-left:3px solid var(--green)}
+.toast.err{border-left:3px solid var(--red)}
 
 /* — Filter — */
 .list-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.list-head h2{font-size:16px;font-weight:600}
+.list-head h2{font-size:15px;font-weight:700;color:var(--text)}
 .filters{display:flex;gap:8px}
-.filters select{width:auto;padding:6px 10px;font-size:12px;margin:0}
+.filters select{width:auto;padding:6px 10px;font-size:12px;margin:0;border-radius:8px}
 
 /* — Empty — */
-.empty{text-align:center;padding:40px;color:var(--muted)}
-.empty-ico{font-size:30px;opacity:.4;margin-bottom:6px}
+.empty{text-align:center;padding:48px 20px;color:var(--muted)}
+.empty-ico{font-size:28px;opacity:.4;margin-bottom:8px}
 
-/* — GenLayer references — */
-.genlayer-badge{
-  font-size:10px;padding:2px 8px;border-radius:20px;text-decoration:none;
-  background:linear-gradient(90deg,rgba(168,85,247,.2),rgba(236,72,153,.2));
-  border:1px solid rgba(168,85,247,.4);color:#c084fc;white-space:nowrap;
-  transition:border-color .2s}
-.genlayer-badge:hover{border-color:#a855f7}
-.genlayer-inline{
-  font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;
-  color:var(--accent);opacity:.7;margin-left:8px}
-.genlayer-note{
+/* — Note box — */
+.agent-note{
   margin-top:12px;padding:10px 14px;border-radius:8px;font-size:11px;
-  background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);
-  color:var(--muted);line-height:1.6}
-.genlayer-note a{color:var(--accent);text-decoration:none}
-.genlayer-note a:hover{text-decoration:underline}
+  background:#f5f3ff;border:1px solid #ddd6fe;color:var(--muted);line-height:1.6
+}
+
+/* — Divider — */
+.divider{height:1px;background:var(--border);margin:14px 0}
 </style>
+<script type="module">
+// Load viem from CDN
+import { createPublicClient, createWalletClient, http, custom, parseEther, formatEther } from 'https://esm.sh/viem@2.21.0';
+import { base } from 'https://esm.sh/viem@2.21.0/chains';
+
+window.__viem = { createPublicClient, createWalletClient, http, custom, parseEther, formatEther, base };
+window.__viemReady = true;
+window.dispatchEvent(new Event('viemReady'));
+</script>
 </head>
 <body>
 
 <div class="header">
   <div class="logo">
-    <h1>🔮 Prediction Oracle</h1>
-    <span class="tag">Multi-Agent Consensus</span>
-    <a class="genlayer-badge" href="https://genlayer.com" target="_blank" title="Inspired by GenLayer Intelligent Contracts">
-      Powered by GenLayer concept
-    </a>
+    <div class="logo-icon">🔮</div>
+    <h1>Prediction Oracle</h1>
+    <span class="tag">Multi-Agent · Base Mainnet</span>
   </div>
   <div class="stats">
     <span>Markets: <b id="s-total">0</b></span>
@@ -583,94 +750,102 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
 </div>
 
 <div class="wrap">
-  <div class="grid">
 
-    <!-- ─ Sidebar ─ -->
-    <div>
-      <!-- Create Market -->
-      <div class="panel">
-        <div class="panel-title">Create Market</div>
-        <label>Your address</label>
-        <input id="c-creator" value="web" placeholder="your_address"/>
-        <label>Question</label>
-        <input id="c-question" placeholder="BTC > $100k by June 1 2025?"/>
-        <label>Category</label>
-        <select id="c-category">
-          <option value="crypto">Crypto</option>
-          <option value="sports">Sports</option>
-          <option value="politics">Politics</option>
-          <option value="custom">Custom</option>
-        </select>
-        <label>Description</label>
-        <textarea id="c-desc" placeholder="Detailed description of the market..."></textarea>
-        <label>Resolution rule (for agents)</label>
-        <input id="c-rule" placeholder='e.g. "price > $100000" or "team X wins"'/>
-        <label>Resolution date (UTC)</label>
-        <input id="c-date" type="datetime-local"/>
-        <button class="btn" onclick="createMarket()">Create Market</button>
-        <div id="c-msg"></div>
+  <!-- ─ Row 1: Action panels horizontal ─ -->
+  <div class="actions-row">
+
+    <!-- Create Market -->
+    <div class="panel">
+      <div class="panel-title">Create Market</div>
+      <label>Your address</label>
+      <input id="c-creator" value="web" placeholder="your_address"/>
+      <label>Question</label>
+      <input id="c-question" placeholder="Will BTC exceed $100k by June 1?"/>
+      <label>Category</label>
+      <select id="c-category">
+        <option value="crypto">Crypto</option>
+        <option value="sports">Sports</option>
+        <option value="politics">Politics</option>
+        <option value="custom">Custom</option>
+      </select>
+      <label>Description</label>
+      <textarea id="c-desc" placeholder="Detailed description..." style="min-height:56px"></textarea>
+      <label>Resolution rule</label>
+      <input id="c-rule" placeholder='price > $100000'/>
+      <label>Resolution date (UTC)</label>
+      <input id="c-date" type="datetime-local"/>
+      <button class="btn" onclick="createMarket()">Create Market</button>
+      <div id="c-msg"></div>
+    </div>
+
+    <!-- Place Bet -->
+    <div class="panel">
+      <div class="panel-title">Place Bet</div>
+      <label>Market ID</label>
+      <input id="b-id" type="number" placeholder="0"/>
+      <label>Bettor address</label>
+      <input id="b-bettor" value="web" placeholder="your_address"/>
+      <label>Position</label>
+      <div class="bet-builder">
+        <div class="pos-btn pos-yes active" id="pos-yes" onclick="selectPos('YES')">✅ YES</div>
+        <div class="pos-btn pos-no" id="pos-no" onclick="selectPos('NO')">❌ NO</div>
       </div>
+      <label>Amount (ETH)</label>
+      <input id="b-amount" type="number" step="0.001" placeholder="0.01"/>
+      <button class="btn" onclick="placeBet()">Place Bet</button>
+      <div id="b-msg"></div>
+    </div>
 
-      <!-- Place Bet -->
-      <div class="panel">
-        <div class="panel-title">Place Bet</div>
-        <label>Market ID</label>
-        <input id="b-id" type="number" placeholder="0"/>
-        <label>Bettor address</label>
-        <input id="b-bettor" value="web" placeholder="your_address"/>
-        <label>Position</label>
-        <div class="bet-builder">
-          <div class="pos-btn pos-yes active" id="pos-yes" onclick="selectPos('YES')">✅ YES</div>
-          <div class="pos-btn pos-no" id="pos-no" onclick="selectPos('NO')">❌ NO</div>
-        </div>
-        <label>Amount (ETH)</label>
-        <input id="b-amount" type="number" step="0.001" placeholder="0.1"/>
-        <button class="btn" onclick="placeBet()">Place Bet</button>
-        <div id="b-msg"></div>
-      </div>
+    <!-- Resolve + Contract Info -->
+    <div class="panel">
+      <div class="panel-title">Oracle Resolution</div>
+      <label>Market ID</label>
+      <input id="r-id" type="number" placeholder="0"/>
+      <label>Caller address</label>
+      <input id="r-caller" value="web" placeholder="your_address"/>
+      <button class="btn" id="r-btn" onclick="resolveMarket()">🤖 Run 3-Agent Consensus</button>
+      <div id="r-msg"></div>
 
-      <!-- Resolve -->
-      <div class="panel">
-        <div class="panel-title">Run Oracle Resolution</div>
-        <label>Market ID</label>
-        <input id="r-id" type="number" placeholder="0"/>
-        <label>Caller address</label>
-        <input id="r-caller" value="web" placeholder="your_address"/>
-        <button class="btn" id="r-btn" onclick="resolveMarket()">🤖 Run 3-Agent Consensus</button>
-        <div id="r-msg"></div>
+      <div class="divider"></div>
+      <div style="font-size:11px;color:var(--muted);line-height:2">
+        <div>Network: <b style="color:var(--green)">Base Mainnet</b></div>
+        <div>Contract: <a href="https://basescan.org/address/0xC5794C686D677202474fF795847B6D82eADe98Da" target="_blank" style="color:var(--accent)">0xC5794C...98Da ↗</a></div>
       </div>
     </div>
 
-    <!-- ─ Main ─ -->
+  </div>
+
+  <!-- ─ Row 2: Markets list + Detail ─ -->
+  <div class="main-row">
+
+    <!-- Markets list -->
     <div>
-
-      <!-- Market list -->
-      <div>
-        <div class="list-head">
-          <h2>📊 All Markets</h2>
-          <div class="filters">
-            <select id="f-status" onchange="loadList()">
-              <option value="all">All</option>
-              <option value="open">Open</option>
-              <option value="locked">Locked</option>
-              <option value="resolving">Resolving</option>
-              <option value="resolved">Resolved</option>
-            </select>
-            <select id="f-cat" onchange="loadList()">
-              <option value="all">All Categories</option>
-              <option value="crypto">Crypto</option>
-              <option value="sports">Sports</option>
-              <option value="politics">Politics</option>
-              <option value="custom">Custom</option>
-            </select>
-            <button class="btn ghost small" onclick="loadList()">Refresh</button>
-          </div>
+      <div class="list-head">
+        <h2>📊 Markets</h2>
+        <div class="filters">
+          <select id="f-status" onchange="loadList()">
+            <option value="all">All</option>
+            <option value="open">Open</option>
+            <option value="locked">Locked</option>
+            <option value="resolving">Resolving</option>
+            <option value="resolved">Resolved</option>
+          </select>
+          <select id="f-cat" onchange="loadList()">
+            <option value="all">All</option>
+            <option value="crypto">Crypto</option>
+            <option value="sports">Sports</option>
+            <option value="politics">Politics</option>
+            <option value="custom">Custom</option>
+          </select>
+          <button class="btn ghost small" onclick="loadList()">↺</button>
         </div>
-        <div class="mkt-list" id="list"></div>
       </div>
+      <div class="mkt-list" id="list"></div>
+    </div>
 
-      <!-- Detail -->
-      <div class="detail" id="detail" style="display:none;margin-top:16px">
+    <!-- Detail -->
+    <div>
+      <div class="detail" id="detail" style="display:none">
         <h2>🔍 Market <span id="d-id"></span></h2>
         <div class="dg" id="d-grid"></div>
 
@@ -680,10 +855,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
         </div>
 
         <div id="d-agents-section" style="display:none;margin-top:16px">
-          <div class="panel-title" style="margin-bottom:8px">
-            Agent votes
-            <span class="genlayer-inline">GenLayer-style: 3 independent agents → majority consensus</span>
-          </div>
+          <div class="panel-title" style="margin-bottom:8px">Agent votes — 3 independent sources → majority</div>
           <div class="agents" id="d-agents"></div>
           <div class="consensus">
             <div>
@@ -692,21 +864,24 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
             </div>
             <div id="d-payouts"></div>
           </div>
-          <div class="genlayer-note">
-            ⚡ Agent 1 &amp; 2 fetch live data from CoinGecko &amp; Binance — Agent 3 (LLM) receives those prices as ground truth, not training memory.
-            Inspired by <a href="https://docs.genlayer.com" target="_blank">GenLayer Intelligent Contracts</a>.
-          </div>
+          <div class="agent-note">⚡ Agents 1 &amp; 2 fetch live prices from CoinGecko &amp; Binance — Agent 3 (LLM) uses those as ground truth, not training memory.</div>
         </div>
       </div>
 
+      <div id="detail-empty" class="panel" style="text-align:center;padding:48px 20px;color:var(--muted)">
+        <div style="width:48px;height:48px;background:#f5f3ff;border-radius:12px;margin:0 auto 12px;display:flex;align-items:center;justify-content:center;font-size:24px">🔍</div>
+        <div style="font-size:14px;font-weight:600;color:var(--text)">Select a market</div>
+        <div style="font-size:12px;margin-top:4px">Agent votes and payouts appear here</div>
+      </div>
     </div>
+
   </div>
 </div>
 
 <!-- Logs -->
 <div class="logs-panel">
   <div class="logs-header">
-    <span><b>Oracle Audit Log</b></span>
+    <span>Oracle Audit Log</span>
     <span id="log-count">0 entries</span>
   </div>
   <div class="logs-body" id="logs"></div>
@@ -718,6 +893,196 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
 <script>
 // ── State ──
 let selectedPos = 'YES';
+let walletClient = null;
+let publicClient = null;
+let userAddress = null;
+
+// ── Contract ABI (only functions we need) ──
+const CONTRACT_ADDRESS = '0xC5794C686D677202474fF795847B6D82eADe98Da';
+const ABI = [
+  {
+    name: 'placeBet',
+    type: 'function',
+    stateMutability: 'payable',
+    inputs: [{name:'marketId',type:'uint256'},{name:'isYes',type:'bool'}],
+    outputs: []
+  },
+  {
+    name: 'claim',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [{name:'marketId',type:'uint256'}],
+    outputs: []
+  },
+  {
+    name: 'getMarket',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{name:'marketId',type:'uint256'}],
+    outputs: [{name:'',type:'tuple',components:[
+      {name:'id',type:'uint256'},
+      {name:'creator',type:'address'},
+      {name:'question',type:'string'},
+      {name:'category',type:'string'},
+      {name:'resolutionRule',type:'string'},
+      {name:'resolutionDate',type:'uint256'},
+      {name:'yesPool',type:'uint256'},
+      {name:'noPool',type:'uint256'},
+      {name:'status',type:'uint8'},
+      {name:'outcome',type:'uint8'},
+      {name:'createdAt',type:'uint256'},
+      {name:'resolvedAt',type:'uint256'}
+    ]}]
+  },
+  {
+    name: 'getPayout',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{name:'marketId',type:'uint256'},{name:'user',type:'address'}],
+    outputs: [{name:'expectedPayout',type:'uint256'}]
+  }
+];
+
+// ── Wait for viem ──
+function waitViem(){
+  return new Promise(res=>{
+    if(window.__viemReady){res();return;}
+    window.addEventListener('viemReady',res,{once:true});
+    setTimeout(res,3000); // fallback
+  });
+}
+
+// ── Connect Wallet ──
+async function connectWallet(){
+  await waitViem();
+  const {createPublicClient,createWalletClient,http,custom,formatEther,base}=window.__viem;
+  try{
+    if(!window.ethereum) throw new Error('No wallet found. Install MetaMask or OKX extension.');
+    const accounts = await window.ethereum.request({method:'eth_requestAccounts'});
+    userAddress = accounts[0];
+
+    // Check Base Mainnet
+    const chainId = await window.ethereum.request({method:'eth_chainId'});
+    if(chainId !== '0x2105'){
+      // Switch to Base Mainnet
+      try{
+        await window.ethereum.request({
+          method:'wallet_switchEthereumChain',
+          params:[{chainId:'0x2105'}]
+        });
+      }catch(sw){
+        // Add Base Mainnet if not exists
+        await window.ethereum.request({
+          method:'wallet_addEthereumChain',
+          params:[{
+            chainId:'0x2105',
+            chainName:'Base',
+            nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},
+            rpcUrls:['https://mainnet.base.org'],
+            blockExplorerUrls:['https://basescan.org']
+          }]
+        });
+      }
+    }
+
+    walletClient = createWalletClient({chain:base,transport:custom(window.ethereum)});
+    publicClient = createPublicClient({chain:base,transport:http('https://mainnet.base.org')});
+
+    // Get balance
+    const bal = await publicClient.getBalance({address:userAddress});
+    const balEth = parseFloat(formatEther(bal)).toFixed(4);
+
+    // Update UI
+    $('connect-btn').style.display='none';
+    $('wallet-info').style.display='flex';
+    $('wallet-addr').textContent=userAddress.slice(0,6)+'...'+userAddress.slice(-4);
+    $('wallet-bal').textContent=balEth+' ETH';
+
+    // Auto-fill address fields
+    $('c-creator').value=userAddress;
+    $('b-bettor').value=userAddress;
+
+    showToast('Wallet connected: '+userAddress.slice(0,6)+'...');
+  }catch(e){
+    showToast(e.message||'Connection failed','err');
+  }
+}
+
+// ── Place Bet Onchain ──
+async function placeBetOnchain(){
+  await waitViem();
+  const {parseEther}=window.__viem;
+  const btn=$('b-onchain-btn');btn.disabled=true;btn.textContent='⏳ Sending tx...';
+  try{
+    if(!walletClient||!userAddress) throw new Error('Connect wallet first');
+    const marketId=BigInt($('b-id').value||'0');
+    const isYes=selectedPos==='YES';
+    const amount=$('b-amount').value||'0.01';
+
+    const hash = await walletClient.writeContract({
+      address:CONTRACT_ADDRESS,
+      abi:ABI,
+      functionName:'placeBet',
+      args:[marketId,isYes],
+      value:parseEther(amount),
+      account:userAddress,
+    });
+
+    setMsg('b-msg','✅ Tx sent! <a href="https://basescan.org/tx/'+hash+'" target="_blank" style="color:var(--accent)">View on Basescan</a>',true);
+    showToast('Bet tx sent!');
+
+    // Also record in Deno KV for oracle tracking
+    await fetch('/api/markets/'+$('b-id').value+'/bet',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({bettor:userAddress,position:selectedPos,amount:parseFloat(amount)})
+    });
+
+    loadList();loadLogs();
+  }catch(e){
+    setMsg('b-msg','❌ '+(e.shortMessage||e.message||'Failed'),false);
+    showToast(e.shortMessage||'Tx failed','err');
+  }
+  btn.disabled=false;btn.textContent='⛓ Place Bet Onchain (ETH)';
+}
+
+// ── Claim Payout ──
+async function claimPayout(){
+  await waitViem();
+  try{
+    if(!walletClient||!userAddress) throw new Error('Connect wallet first');
+    const id=prompt('Enter Market ID to claim:');
+    if(!id) return;
+
+    const hash = await walletClient.writeContract({
+      address:CONTRACT_ADDRESS,
+      abi:ABI,
+      functionName:'claim',
+      args:[BigInt(id)],
+      account:userAddress,
+    });
+
+    showToast('Claim tx sent!');
+    window.open('https://basescan.org/tx/'+hash,'_blank');
+  }catch(e){
+    showToast(e.shortMessage||e.message||'Claim failed','err');
+  }
+}
+
+// ── Wallet event listeners ──
+if(window.ethereum){
+  window.ethereum.on('accountsChanged',accounts=>{
+    if(accounts.length===0){
+      userAddress=null;walletClient=null;
+      $('connect-btn').style.display='';
+      $('wallet-info').style.display='none';
+    }else{
+      userAddress=accounts[0];
+      $('wallet-addr').textContent=userAddress.slice(0,6)+'...'+userAddress.slice(-4);
+      $('c-creator').value=userAddress;
+      $('b-bettor').value=userAddress;
+    }
+  });
+}
 
 // ── Utils ──
 function $(id){return document.getElementById(id)}
@@ -846,6 +1211,7 @@ async function inspectMarket(id){
     const r=await fetch('/api/markets/'+id);const m=await r.json();
     if(m.error)return;
     $('detail').style.display='block';
+    if($('detail-empty'))$('detail-empty').style.display='none';
     $('d-id').innerHTML=badge(m.status);
 
     const total=(m.yes_pool+m.no_pool).toFixed(4);
@@ -877,7 +1243,7 @@ async function inspectMarket(id){
           '<div class="a-val">'+a.value+'</div>'+
           '<div>'+pill(a.vote)+'</div>'+
           '<div class="a-reason">'+a.reason+'</div>'+
-          '<div style="font-size:10px;color:var(--muted);margin-top:6px;word-break:break-all">'+a.source+'</div>'+
+          '<div class="a-src">'+a.source+'</div>'+
         '</div>').join('');
 
       const cons=m.consensus||'?';
@@ -936,6 +1302,7 @@ Deno.serve(async (req) => {
 
   // Health check
   if (path === "/health") return json({ ok: true, ts: Date.now() });
+
 
   // Frontend
   if (path === "/" || path === "") {
