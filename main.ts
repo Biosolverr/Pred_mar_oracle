@@ -13,8 +13,7 @@ const OR_MODEL_1 = "openai/gpt-oss-120b:free";
 const OR_MODEL_2 = "google/gemma-4-31b-it:free";
 
 // ─── Contract ─────────────────────────────────────────────────────
-const CONTRACT_ADDRESS = "0xC5794C686D677202474fF795847B6D82eADe98Da";
-const OWNER_PRIVATE_KEY = Deno.env.get("OWNER_PRIVATE_KEY") ?? "";
+
 
 // ─── Types ────────────────────────────────────────────────────────
 
@@ -207,7 +206,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${OPENROUTER_KEY}`,
-          "HTTP-Referer": "https://pre-base-market.biosolverr.deno.net",
+          "HTTP-Referer": "https://prediction-oracle.deno.net",
         },
         body: JSON.stringify({
           model: OR_MODEL_1,
@@ -228,7 +227,7 @@ async function agentLLM(market: Market, liveData?: string): Promise<AgentResult>
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${OPENROUTER_KEY}`,
-          "HTTP-Referer": "https://pre-base-market.biosolverr.deno.net",
+          "HTTP-Referer": "https://prediction-oracle.deno.net",
         },
         body: JSON.stringify({
           model: OR_MODEL_2,
@@ -358,79 +357,7 @@ async function runResolution(market: Market): Promise<Market> {
     prices: results.map(r => r.value),
   });
 
-  // Attempt onchain resolve (owner signs tx to contract)
-  const txHash = await resolveOnchain(market.id, consensus);
-  if (txHash) {
-    await addLog("onchain_resolved", { market_id: market.id, tx: txHash });
-  }
-
   return market;
-}
-
-// ─── Onchain Resolve via Viem (Deno backend signs tx) ────────────────
-
-async function resolveOnchain(marketId: number, consensus: string): Promise<string | null> {
-  if (!OWNER_PRIVATE_KEY) {
-    await addLog("onchain_skip", { reason: "No OWNER_PRIVATE_KEY set" });
-    return null;
-  }
-
-  // Outcome enum: 0=Unresolved, 1=YES, 2=NO, 3=Invalid
-  const outcomeMap: Record<string, number> = { YES: 1, NO: 2, INVALID: 3 };
-  const outcomeVal = outcomeMap[consensus] ?? 3;
-
-  const CONTRACT = "0xC5794C686D677202474fF795847B6D82eADe98Da";
-  const RPC = "https://mainnet.base.org";
-
-  try {
-    // Encode function call: resolve(uint256,uint8)
-    // Function selector: keccak256("resolve(uint256,uint8)")[0:4]
-    const selector = "0x6a791f7f"; // resolve(uint256,uint8)
-    const idHex = marketId.toString(16).padStart(64, "0");
-    const outHex = outcomeVal.toString(16).padStart(64, "0");
-    const data = selector + idHex + outHex;
-
-    // Get nonce
-    const nonceResp = await fetch(RPC, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0", id: 1, method: "eth_getTransactionCount",
-        params: [await getAddressFromKey(OWNER_PRIVATE_KEY), "latest"]
-      })
-    });
-    const nonceData = await nonceResp.json();
-    const nonce = parseInt(nonceData.result, 16);
-
-    // Get gas price
-    const gasResp = await fetch(RPC, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_gasPrice", params: [] })
-    });
-    const gasData = await gasResp.json();
-    const gasPrice = gasData.result;
-
-    await addLog("onchain_resolve_attempt", { marketId, consensus, outcome: outcomeVal, nonce });
-
-    // Note: Full tx signing requires secp256k1 — use eth_sendRawTransaction
-    // For now log intent, return null (upgrade path: add npm:viem in Deno)
-    await addLog("onchain_resolve_note", {
-      msg: "Add OWNER_PRIVATE_KEY + viem npm import for full onchain resolve",
-      marketId,
-      outcome: outcomeVal,
-      contract: CONTRACT
-    });
-    return null;
-  } catch (e) {
-    await addLog("onchain_resolve_error", { error: e.message });
-    return null;
-  }
-}
-
-async function getAddressFromKey(_privateKey: string): Promise<string> {
-  // Placeholder — real impl needs secp256k1
-  return OWNER || "0x0000000000000000000000000000000000000000";
 }
 
 // ─── HTTP Helpers ──────────────────────────────────────────────────
@@ -458,7 +385,6 @@ function html(): string {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<meta name="base:app_id" content="6a00924bef4989446dc30c5b"/>
 <title>Prediction Market Oracle</title>
 <style>
 :root{
@@ -725,13 +651,6 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
 .divider{height:1px;background:var(--border);margin:14px 0}
 </style>
 <script type="module">
-// Load viem from CDN
-import { createPublicClient, createWalletClient, http, custom, parseEther, formatEther } from 'https://esm.sh/viem@2.21.0';
-import { base } from 'https://esm.sh/viem@2.21.0/chains';
-
-window.__viem = { createPublicClient, createWalletClient, http, custom, parseEther, formatEther, base };
-window.__viemReady = true;
-window.dispatchEvent(new Event('viemReady'));
 </script>
 </head>
 <body>
@@ -809,8 +728,7 @@ window.dispatchEvent(new Event('viemReady'));
 
       <div class="divider"></div>
       <div style="font-size:11px;color:var(--muted);line-height:2">
-        <div>Network: <b style="color:var(--green)">Base Mainnet</b></div>
-        <div>Contract: <a href="https://basescan.org/address/0xC5794C686D677202474fF795847B6D82eADe98Da" target="_blank" style="color:var(--accent)">0xC5794C...98Da ↗</a></div>
+        <div>Contract: <span style="color:var(--accent)">0xC5794C...98Da</span></div>
       </div>
     </div>
 
@@ -894,196 +812,6 @@ window.dispatchEvent(new Event('viemReady'));
 <script>
 // ── State ──
 let selectedPos = 'YES';
-let walletClient = null;
-let publicClient = null;
-let userAddress = null;
-
-// ── Contract ABI (only functions we need) ──
-const CONTRACT_ADDRESS = '0xC5794C686D677202474fF795847B6D82eADe98Da';
-const ABI = [
-  {
-    name: 'placeBet',
-    type: 'function',
-    stateMutability: 'payable',
-    inputs: [{name:'marketId',type:'uint256'},{name:'isYes',type:'bool'}],
-    outputs: []
-  },
-  {
-    name: 'claim',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [{name:'marketId',type:'uint256'}],
-    outputs: []
-  },
-  {
-    name: 'getMarket',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [{name:'marketId',type:'uint256'}],
-    outputs: [{name:'',type:'tuple',components:[
-      {name:'id',type:'uint256'},
-      {name:'creator',type:'address'},
-      {name:'question',type:'string'},
-      {name:'category',type:'string'},
-      {name:'resolutionRule',type:'string'},
-      {name:'resolutionDate',type:'uint256'},
-      {name:'yesPool',type:'uint256'},
-      {name:'noPool',type:'uint256'},
-      {name:'status',type:'uint8'},
-      {name:'outcome',type:'uint8'},
-      {name:'createdAt',type:'uint256'},
-      {name:'resolvedAt',type:'uint256'}
-    ]}]
-  },
-  {
-    name: 'getPayout',
-    type: 'function',
-    stateMutability: 'view',
-    inputs: [{name:'marketId',type:'uint256'},{name:'user',type:'address'}],
-    outputs: [{name:'expectedPayout',type:'uint256'}]
-  }
-];
-
-// ── Wait for viem ──
-function waitViem(){
-  return new Promise(res=>{
-    if(window.__viemReady){res();return;}
-    window.addEventListener('viemReady',res,{once:true});
-    setTimeout(res,3000); // fallback
-  });
-}
-
-// ── Connect Wallet ──
-async function connectWallet(){
-  await waitViem();
-  const {createPublicClient,createWalletClient,http,custom,formatEther,base}=window.__viem;
-  try{
-    if(!window.ethereum) throw new Error('No wallet found. Install MetaMask or OKX extension.');
-    const accounts = await window.ethereum.request({method:'eth_requestAccounts'});
-    userAddress = accounts[0];
-
-    // Check Base Mainnet
-    const chainId = await window.ethereum.request({method:'eth_chainId'});
-    if(chainId !== '0x2105'){
-      // Switch to Base Mainnet
-      try{
-        await window.ethereum.request({
-          method:'wallet_switchEthereumChain',
-          params:[{chainId:'0x2105'}]
-        });
-      }catch(sw){
-        // Add Base Mainnet if not exists
-        await window.ethereum.request({
-          method:'wallet_addEthereumChain',
-          params:[{
-            chainId:'0x2105',
-            chainName:'Base',
-            nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},
-            rpcUrls:['https://mainnet.base.org'],
-            blockExplorerUrls:['https://basescan.org']
-          }]
-        });
-      }
-    }
-
-    walletClient = createWalletClient({chain:base,transport:custom(window.ethereum)});
-    publicClient = createPublicClient({chain:base,transport:http('https://mainnet.base.org')});
-
-    // Get balance
-    const bal = await publicClient.getBalance({address:userAddress});
-    const balEth = parseFloat(formatEther(bal)).toFixed(4);
-
-    // Update UI
-    $('connect-btn').style.display='none';
-    $('wallet-info').style.display='flex';
-    $('wallet-addr').textContent=userAddress.slice(0,6)+'...'+userAddress.slice(-4);
-    $('wallet-bal').textContent=balEth+' ETH';
-
-    // Auto-fill address fields
-    $('c-creator').value=userAddress;
-    $('b-bettor').value=userAddress;
-
-    showToast('Wallet connected: '+userAddress.slice(0,6)+'...');
-  }catch(e){
-    showToast(e.message||'Connection failed','err');
-  }
-}
-
-// ── Place Bet Onchain ──
-async function placeBetOnchain(){
-  await waitViem();
-  const {parseEther}=window.__viem;
-  const btn=$('b-onchain-btn');btn.disabled=true;btn.textContent='⏳ Sending tx...';
-  try{
-    if(!walletClient||!userAddress) throw new Error('Connect wallet first');
-    const marketId=BigInt($('b-id').value||'0');
-    const isYes=selectedPos==='YES';
-    const amount=$('b-amount').value||'0.01';
-
-    const hash = await walletClient.writeContract({
-      address:CONTRACT_ADDRESS,
-      abi:ABI,
-      functionName:'placeBet',
-      args:[marketId,isYes],
-      value:parseEther(amount),
-      account:userAddress,
-    });
-
-    setMsg('b-msg','✅ Tx sent! <a href="https://basescan.org/tx/'+hash+'" target="_blank" style="color:var(--accent)">View on Basescan</a>',true);
-    showToast('Bet tx sent!');
-
-    // Also record in Deno KV for oracle tracking
-    await fetch('/api/markets/'+$('b-id').value+'/bet',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({bettor:userAddress,position:selectedPos,amount:parseFloat(amount)})
-    });
-
-    loadList();loadLogs();
-  }catch(e){
-    setMsg('b-msg','❌ '+(e.shortMessage||e.message||'Failed'),false);
-    showToast(e.shortMessage||'Tx failed','err');
-  }
-  btn.disabled=false;btn.textContent='⛓ Place Bet Onchain (ETH)';
-}
-
-// ── Claim Payout ──
-async function claimPayout(){
-  await waitViem();
-  try{
-    if(!walletClient||!userAddress) throw new Error('Connect wallet first');
-    const id=prompt('Enter Market ID to claim:');
-    if(!id) return;
-
-    const hash = await walletClient.writeContract({
-      address:CONTRACT_ADDRESS,
-      abi:ABI,
-      functionName:'claim',
-      args:[BigInt(id)],
-      account:userAddress,
-    });
-
-    showToast('Claim tx sent!');
-    window.open('https://basescan.org/tx/'+hash,'_blank');
-  }catch(e){
-    showToast(e.shortMessage||e.message||'Claim failed','err');
-  }
-}
-
-// ── Wallet event listeners ──
-if(window.ethereum){
-  window.ethereum.on('accountsChanged',accounts=>{
-    if(accounts.length===0){
-      userAddress=null;walletClient=null;
-      $('connect-btn').style.display='';
-      $('wallet-info').style.display='none';
-    }else{
-      userAddress=accounts[0];
-      $('wallet-addr').textContent=userAddress.slice(0,6)+'...'+userAddress.slice(-4);
-      $('c-creator').value=userAddress;
-      $('b-bettor').value=userAddress;
-    }
-  });
-}
 
 // ── Utils ──
 function $(id){return document.getElementById(id)}
