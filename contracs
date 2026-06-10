@@ -1,0 +1,374 @@
+# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+
+# Autonomous Prediction Market Oracle — GenLayer Intelligent Contract
+# 3-source consensus (CoinGecko · Binance · LLM) → majority vote 2/3
+
+from genlayer import *
+import json
+
+
+class PredictionMarketOracle(gl.Contract):
+
+    owner:          str
+    market_cnt:     u256
+
+    # Flat storage — one TreeMap per field to avoid nested-dataclass issues
+    m_creator:      TreeMap[u256, str]
+    m_question:     TreeMap[u256, str]
+    m_description:  TreeMap[u256, str]
+    m_category:     TreeMap[u256, str]
+    m_rule:         TreeMap[u256, str]
+    m_res_date:     TreeMap[u256, u256]
+    m_yes_pool:     TreeMap[u256, u256]
+    m_no_pool:      TreeMap[u256, u256]
+    m_status:       TreeMap[u256, str]
+    m_consensus:    TreeMap[u256, str]
+    m_votes_json:   TreeMap[u256, str]
+    m_bets_json:    TreeMap[u256, str]
+
+    def __init__(self, owner: str):
+        # Only primitive fields — TreeMap fields are auto-initialised by GenVM
+        self.owner      = owner
+        self.market_cnt = u256(0)
+
+    # ── Read ──────────────────────────────────────────────────────────────────
+
+    @gl.public.view
+    def get_owner(self) -> str:
+        return self.owner
+
+    @gl.public.view
+    def get_market_count(self) -> u256:
+        return self.market_cnt
+
+    @gl.public.view
+    def get_market(self, market_id: u256) -> str:
+        mid = market_id
+        return json.dumps({
+            "id":              int(mid),
+            "creator":         self.m_creator[mid],
+            "question":        self.m_question[mid],
+            "description":     self.m_description[mid],
+            "category":        self.m_category[mid],
+            "resolution_rule": self.m_rule[mid],
+            "resolution_date": int(self.m_res_date[mid]),
+            "yes_pool":        int(self.m_yes_pool[mid]),
+            "no_pool":         int(self.m_no_pool[mid]),
+            "status":          self.m_status[mid],
+            "consensus":       self.m_consensus[mid],
+            "agent_votes":     json.loads(self.m_votes_json[mid]),
+            "bets":            json.loads(self.m_bets_json[mid]),
+        })
+
+    # ── Write ─────────────────────────────────────────────────────────────────
+
+    @gl.public.write
+    def create_market(
+        self,
+        question:        str,
+        description:     str,
+        category:        str,
+        resolution_rule: str,
+        resolution_date: u256,
+    ) -> u256:
+        """
+        Create a prediction market.
+        category:        "crypto" | "sports" | "politics" | "custom"
+        resolution_rule: e.g. "price > 100000"
+        resolution_date: unix timestamp in seconds
+        """
+        mid = self.market_cnt
+
+        # FIX 1: cast Address → str explicitly
+        self.m_creator[mid]     = str(gl.message.sender_address)
+        self.m_question[mid]    = question
+        self.m_description[mid] = description
+        self.m_category[mid]    = category
+        self.m_rule[mid]        = resolution_rule
+        self.m_res_date[mid]    = resolution_date
+        self.m_yes_pool[mid]    = u256(0)
+        self.m_no_pool[mid]     = u256(0)
+        self.m_status[mid]      = "open"
+        self.m_consensus[mid]   = ""
+        self.m_votes_json[mid]  = "[]"
+        self.m_bets_json[mid]   = "[]"
+
+        self.market_cnt = u256(int(self.market_cnt) + 1)
+        print(f"[create_market] id={int(mid)} q={question}")
+        return mid
+
+    @gl.public.write
+    def place_bet(self, market_id: u256, position: str, amount: u256) -> None:
+        """Record a YES or NO bet (amount in wei-like units)."""
+        assert position in ("YES", "NO"), "position must be YES or NO"
+        assert self.m_status[market_id] == "open", "market not open"
+
+        bets = json.loads(self.m_bets_json[market_id])
+        bets.append({
+            # FIX 1: cast Address → str explicitly
+            "bettor":   str(gl.message.sender_address),
+            "position": position,
+            "amount":   int(amount),
+        })
+        self.m_bets_json[market_id] = json.dumps(bets)
+
+        if position == "YES":
+            self.m_yes_pool[market_id] = u256(int(self.m_yes_pool[market_id]) + int(amount))
+        else:
+            self.m_no_pool[market_id]  = u256(int(self.m_no_pool[market_id])  + int(amount))
+
+        print(f"[place_bet] market={int(market_id)} pos={position} amt={int(amount)}")
+
+    @gl.public.write
+    def resolve(self, market_id: u256) -> str:
+        """
+        Run 3-source oracle consensus and resolve the market.
+
+        Agent 1 — CoinGecko public API  (crypto price)
+        Agent 2 — Binance public API    (crypto price)
+        Agent 3 — LLM web oracle        (universal)
+
+        Majority vote 2/3 → YES | NO | UNRESOLVED
+        gl.eq_principle.prompt_comparative — validators compare meaning via NLP, not bytes.
+        Handles live price drift between validator nodes gracefully.
+        """
+        assert self.m_status[market_id] == "open", "market not open"
+
+        question = self.m_question[market_id]
+        category = self.m_category[market_id]
+        rule     = self.m_rule[market_id]
+
+        def nondet() -> str:
+            votes: list = []
+
+            # ── Agent 1: CoinGecko ────────────────────────────────────────────
+            if category == "crypto":
+                try:
+                    coin_map = {
+                        "btc":      "bitcoin",
+                        "bitcoin":  "bitcoin",
+                        "eth":      "ethereum",
+                        "ethereum": "ethereum",
+                        "sol":      "solana",
+                        "solana":   "solana",
+                        "bnb":      "binancecoin",
+                        "xrp":      "ripple",
+                        "ada":      "cardano",
+                    }
+                    q       = question.lower()
+                    coin_id = next((v for k, v in coin_map.items() if k in q), "bitcoin")
+
+                    # FIX 2: CoinGecko now requires API key even for Demo plan.
+                    # Keyless public API still exists but is heavily rate-limited
+                    # (5-15 req/min) and may return non-standard responses.
+                    # We use the keyless endpoint and add robust response validation.
+                    url  = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+                    resp = gl.nondet.web.get(url)
+                    body = resp.body.decode("utf-8")
+                    data = json.loads(body)
+
+                    # FIX 2a: validate response structure before indexing
+                    if not isinstance(data, dict):
+                        raise ValueError(f"unexpected response type: {type(data)}")
+                    if coin_id not in data:
+                        raise ValueError(f"coin '{coin_id}' not in response: {body[:200]}")
+                    if "usd" not in data[coin_id]:
+                        raise ValueError(f"'usd' not in data['{coin_id}']: {data[coin_id]}")
+
+                    price = float(data[coin_id]["usd"])
+
+                    # FIX 3: round price to 2 decimals before compare to reduce
+                    # validator disagreement caused by float drift between nodes
+                    price = round(price, 2)
+                    vote  = _eval_rule(rule, price)
+                    votes.append({
+                        "source": "CoinGecko",
+                        "value":  f"${price:,.2f}",
+                        "vote":   vote,
+                        "reason": f"{coin_id}=${price:,.2f}",
+                    })
+                    print(f"[agent1/CoinGecko] price={price} vote={vote}")
+                except Exception as e:
+                    votes.append({
+                        "source": "CoinGecko",
+                        "value":  "error",
+                        "vote":   "UNRESOLVED",
+                        "reason": str(e),
+                    })
+                    print(f"[agent1/CoinGecko] error: {e}")
+            else:
+                votes.append({
+                    "source": "CoinGecko",
+                    "value":  "N/A",
+                    "vote":   "UNRESOLVED",
+                    "reason": "not a crypto market",
+                })
+
+            # ── Agent 2: Binance ──────────────────────────────────────────────
+            if category == "crypto":
+                try:
+                    sym_map = {
+                        "btc":      "BTCUSDT",
+                        "bitcoin":  "BTCUSDT",
+                        "eth":      "ETHUSDT",
+                        "ethereum": "ETHUSDT",
+                        "sol":      "SOLUSDT",
+                        "solana":   "SOLUSDT",
+                        "bnb":      "BNBUSDT",
+                        "xrp":      "XRPUSDT",
+                        "ada":      "ADAUSDT",
+                    }
+                    q    = question.lower()
+                    sym  = next((v for k, v in sym_map.items() if k in q), "BTCUSDT")
+                    url  = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
+                    resp = gl.nondet.web.get(url)
+                    body = resp.body.decode("utf-8")
+                    data = json.loads(body)
+
+                    # FIX 2b: validate Binance response structure
+                    if "price" not in data:
+                        raise ValueError(f"'price' not in Binance response: {body[:200]}")
+
+                    price = round(float(data["price"]), 2)
+                    vote  = _eval_rule(rule, price)
+                    votes.append({
+                        "source": "Binance",
+                        "value":  f"${price:,.2f}",
+                        "vote":   vote,
+                        "reason": f"{sym}=${price:,.2f}",
+                    })
+                    print(f"[agent2/Binance] price={price} vote={vote}")
+                except Exception as e:
+                    votes.append({
+                        "source": "Binance",
+                        "value":  "error",
+                        "vote":   "UNRESOLVED",
+                        "reason": str(e),
+                    })
+                    print(f"[agent2/Binance] error: {e}")
+            else:
+                votes.append({
+                    "source": "Binance",
+                    "value":  "N/A",
+                    "vote":   "UNRESOLVED",
+                    "reason": "not a crypto market",
+                })
+
+            # ── Agent 3: LLM Oracle ───────────────────────────────────────────
+            live_ctx = ""
+            real = [
+                v for v in votes
+                if v["vote"] != "UNRESOLVED" and v["value"] not in ("N/A", "error")
+            ]
+            if real:
+                live_ctx = (
+                    "LIVE PRICE DATA (fetched right now — use this, ignore training cutoff):\n"
+                    + "\n".join(f"  {v['source']}: {v['value']}" for v in real)
+                    + "\n\n"
+                )
+
+            task = (
+                "You are a strict prediction market resolver.\n\n"
+                + live_ctx
+                + f'QUESTION: "{question}"\n'
+                  f'CATEGORY: {category}\n'
+                  f'RESOLUTION RULE: "{rule}"\n\n'
+                  "INSTRUCTIONS:\n"
+                  "- If live price data is shown above, use it as ground truth.\n"
+                  "- For sports/politics/custom markets, reason from your knowledge.\n"
+                  "- Apply the resolution rule precisely.\n"
+                  # FIX 4: explicit instruction to output ONLY raw JSON, no markdown
+                  "- Output ONLY a single raw JSON object on one line, no markdown, no backticks.\n"
+                  "- Do NOT wrap in ```json or any other formatting.\n"
+                  "- Exactly one of these three forms:\n"
+                  '{"vote":"YES","value":"<observed>","reason":"<brief>"}\n'
+                  '{"vote":"NO","value":"<observed>","reason":"<brief>"}\n'
+                  '{"vote":"UNRESOLVED","value":"<observed>","reason":"<why>"}'
+            )
+            try:
+                raw = gl.nondet.exec_prompt(task)
+
+                # FIX 4: strip markdown fences + whitespace aggressively
+                clean = raw.strip()
+                for fence in ("```json", "```"):
+                    clean = clean.replace(fence, "")
+                clean = clean.strip()
+
+                # FIX 4b: if LLM returned multiple lines, grab the first JSON line
+                for line in clean.splitlines():
+                    line = line.strip()
+                    if line.startswith("{") and line.endswith("}"):
+                        clean = line
+                        break
+
+                parsed = json.loads(clean)
+                assert parsed.get("vote") in ("YES", "NO", "UNRESOLVED"), \
+                    f"bad vote value: {parsed.get('vote')}"
+
+                votes.append({
+                    "source": "LLM Oracle",
+                    "value":  str(parsed.get("value", "")),
+                    "vote":   parsed["vote"],
+                    "reason": str(parsed.get("reason", "")),
+                })
+                print(f"[agent3/LLM] vote={parsed['vote']}")
+            except Exception as e:
+                votes.append({
+                    "source": "LLM Oracle",
+                    "value":  "error",
+                    "vote":   "UNRESOLVED",
+                    "reason": str(e),
+                })
+                print(f"[agent3/LLM] error: {e}")
+
+            # ── Majority vote 2/3 ─────────────────────────────────────────────
+            yes_n = sum(1 for v in votes if v["vote"] == "YES")
+            no_n  = sum(1 for v in votes if v["vote"] == "NO")
+            if yes_n >= 2:
+                consensus = "YES"
+            elif no_n >= 2:
+                consensus = "NO"
+            else:
+                consensus = "UNRESOLVED"
+
+            print(f"[resolve] yes={yes_n} no={no_n} consensus={consensus}")
+            # FIX 5: sort_keys=True + separators → deterministic JSON string
+            # nl_similarity — deterministic JSON still helps validators compare output
+            return json.dumps(
+                {"consensus": consensus, "votes": votes},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        result_str = gl.eq_principle.prompt_comparative(
+            nondet,
+            "The consensus field must be identical (YES, NO, or UNRESOLVED). Minor differences in price values between sources are acceptable.",
+        )
+        result     = json.loads(result_str)
+        consensus  = result["consensus"]
+
+        self.m_consensus[market_id]  = consensus
+        self.m_votes_json[market_id] = json.dumps(result["votes"])
+        if consensus in ("YES", "NO"):
+            self.m_status[market_id] = "resolved"
+
+        return result_str
+
+
+def _eval_rule(rule: str, price: float) -> str:
+    """Parse simple rule strings: 'price > 100000', 'price <= 50', etc."""
+    r = rule.lower().replace("price", "").strip()
+    try:
+        if r.startswith(">="):
+            return "YES" if price >= float(r[2:].strip()) else "NO"
+        if r.startswith(">"):
+            return "YES" if price >  float(r[1:].strip()) else "NO"
+        if r.startswith("<="):
+            return "YES" if price <= float(r[2:].strip()) else "NO"
+        if r.startswith("<"):
+            return "YES" if price <  float(r[1:].strip()) else "NO"
+        if r.startswith("=="):
+            return "YES" if price == float(r[2:].strip()) else "NO"
+    except Exception:
+        pass
+    return "UNRESOLVED"
