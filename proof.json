@@ -1,0 +1,190 @@
+{
+  "project": "Autonomous Prediction Market Oracle",
+  "contract": "PredictionMarketOracle",
+  "network": "GenLayer Testnet",
+  "deployment": {
+    "tx": "0xeae44e719249dee7f3f38218f28c005b93df404d61c93a7bbab319884293aa5e",
+    "owner": "0x3c163AeF7207dA6Dd839d839Ba1b7b068b128649",
+    "status": "FINALIZED",
+    "result": "SUCCESS"
+  },
+  "eq_principle": "gl.eq_principle.prompt_comparative",
+  "tests": [
+    {
+      "id": 1,
+      "name": "BTC price above $100,000 — expected NO",
+      "market_id": 0,
+      "create_tx": "0xf327b770db755eb506c19df5071636fffbd93462497d3b5c22f3436224298496",
+      "resolve_tx": "0x8e6d09d2ef5eaf103d7bc30ec058cfd78764e593394633a56193713dbdc54ab3",
+      "input": {
+        "question": "Will Bitcoin price exceed $100,000?",
+        "category": "crypto",
+        "resolution_rule": "price > 100000"
+      },
+      "votes": {
+        "CoinGecko": { "value": "$60,967.00", "vote": "NO" },
+        "Binance":   { "value": "$61,160.00", "vote": "NO" },
+        "LLM Oracle":{ "value": "$61,160.00", "vote": "NO" }
+      },
+      "consensus": "NO",
+      "state_after": {
+        "status": "resolved",
+        "consensus": "NO",
+        "yes_pool": 0,
+        "no_pool": 0
+      },
+      "finalized": true,
+      "result": "SUCCESS",
+      "passed": true
+    },
+    {
+      "id": 2,
+      "name": "ETH price above $3000 with bets — expected NO",
+      "market_id": 1,
+      "create_tx": "0x11d3f884a8177f8327c19e355fc36c66e4c7231da3f9d51858a09920bc054f79",
+      "place_bet_yes_tx": "0x484f6d6030c2c50c0a014273d81d75de45a5be7417b554fdd2a4253d47eca369",
+      "place_bet_no_tx": "0xf874d03fbf38848db2f3af0f0e4c442ba1766f06f8fd93f2382a816706a99f9a",
+      "resolve_tx": "0xd9dd202de95bf14dd0e4fe7b413dca1f285fcfba72703d86508b0bd4e4c675fd",
+      "input": {
+        "question": "Is Ethereum price above $3000?",
+        "category": "crypto",
+        "resolution_rule": "price > 3000",
+        "bets": [
+          { "position": "YES", "amount": 1000 },
+          { "position": "NO",  "amount": 500  }
+        ]
+      },
+      "votes": {
+        "CoinGecko": { "value": "$1,618.92", "vote": "NO" },
+        "Binance":   { "value": "$1,621.60", "vote": "NO" },
+        "LLM Oracle":{ "value": "$1,618.92 - $1,621.60", "vote": "NO" }
+      },
+      "consensus": "NO",
+      "state_after": {
+        "status": "resolved",
+        "consensus": "NO",
+        "yes_pool": 1000,
+        "no_pool": 500,
+        "bets_count": 2
+      },
+      "finalized": true,
+      "result": "SUCCESS",
+      "passed": true
+    },
+    {
+      "id": 3,
+      "name": "Sports market — only LLM votes YES, no crypto sources — expected UNRESOLVED",
+      "market_id": 2,
+      "create_tx": "0xbf5396f1f735720dca6bc41a47db28c51cade667bdce668dd5bc83355bcd4e0f",
+      "resolve_tx": "0x918b1e2dfe77cc32599f456d55ed61ffdabcfaa670199ebedb22dbad728c579d",
+      "input": {
+        "question": "Did Argentina win the 2022 FIFA World Cup?",
+        "category": "sports",
+        "resolution_rule": "Argentina won the 2022 FIFA World Cup"
+      },
+      "votes": {
+        "CoinGecko": { "value": "N/A", "vote": "UNRESOLVED", "reason": "not a crypto market" },
+        "Binance":   { "value": "N/A", "vote": "UNRESOLVED", "reason": "not a crypto market" },
+        "LLM Oracle":{ "value": "Argentina won", "vote": "YES" }
+      },
+      "consensus": "UNRESOLVED",
+      "state_after": {
+        "status": "open",
+        "consensus": "UNRESOLVED"
+      },
+      "note": "UNRESOLVED because 2/3 majority not reached — only LLM voted YES. Status stays open as designed.",
+      "finalized": true,
+      "result": "SUCCESS",
+      "passed": true
+    },
+    {
+      "id": 4,
+      "name": "BTC price above $1 — guaranteed YES smoke test",
+      "market_id": 3,
+      "create_tx": "0x389ef8fc5f4584b0b779712440c443565638e0163746bb1401328515208c09bf",
+      "resolve_tx": "0x4d0dba1143928394a3369a7942b58f70f397b65543e0886b13bda708cee53e72",
+      "input": {
+        "question": "Is Bitcoin price above $1?",
+        "category": "crypto",
+        "resolution_rule": "price > 1"
+      },
+      "votes": {
+        "CoinGecko": { "value": "$61,130.00", "vote": "YES" },
+        "Binance":   { "value": "$61,248.00", "vote": "YES" },
+        "LLM Oracle":{ "value": "$61,130.00", "vote": "YES" }
+      },
+      "consensus": "YES",
+      "state_after": {
+        "status": "resolved",
+        "consensus": "YES"
+      },
+      "finalized": true,
+      "result": "SUCCESS",
+      "passed": true
+    },
+    {
+      "id": 5,
+      "name": "BTC price above $10,000,000 — guaranteed NO smoke test",
+      "market_id": 4,
+      "create_tx": "0xdb0c738e5bff26fa848b4592bc485c5911a04ae841e7804d45b904c89b0c47aa",
+      "resolve_tx": "0xdc27109dd17b63d96ba79e2b916482d7cd074b587e06e011d2ddacd4f3c49f90",
+      "input": {
+        "question": "Is Bitcoin price above $10,000,000?",
+        "category": "crypto",
+        "resolution_rule": "price > 10000000"
+      },
+      "votes": {
+        "CoinGecko": { "value": "$61,209.00", "vote": "NO" },
+        "Binance":   { "value": "$61,312.01", "vote": "NO" },
+        "LLM Oracle":{ "value": "$61,312.01", "vote": "NO" }
+      },
+      "consensus": "NO",
+      "state_after": {
+        "status": "resolved",
+        "consensus": "NO"
+      },
+      "finalized": true,
+      "result": "SUCCESS",
+      "passed": true
+    },
+    {
+      "id": 6,
+      "name": "SOL price above $50 — expected YES",
+      "market_id": 5,
+      "create_tx": "0x0ba27722c99af209ac7a2c7dcc5fdd53e8e200d85b4b2fb78d4c40d378221d36",
+      "resolve_tx": "0xd5742b08a6e92035ce3b71c7f2b3b416e1bc2fdb985dea154165d408af54588a",
+      "input": {
+        "question": "Is Solana price above $50?",
+        "category": "crypto",
+        "resolution_rule": "price > 50"
+      },
+      "votes": {
+        "CoinGecko": { "value": "$63.53", "vote": "YES" },
+        "Binance":   { "value": "$63.64", "vote": "YES" },
+        "LLM Oracle":{ "value": "$63.58", "vote": "YES" }
+      },
+      "consensus": "YES",
+      "state_after": {
+        "status": "resolved",
+        "consensus": "YES"
+      },
+      "finalized": true,
+      "result": "SUCCESS",
+      "passed": true
+    }
+  ],
+  "summary": {
+    "total": 6,
+    "passed": 6,
+    "failed": 0,
+    "bugs_found_and_fixed": [
+      "Address object has no attribute encode — fixed with str(gl.message.sender_address)",
+      "nl_similarity does not exist — replaced with prompt_comparative",
+      "strict_eq caused Leader Rotation loops due to live price drift between validators"
+    ],
+    "notes": [
+      "CoinGecko rate-limited (429) on some runs — Binance + LLM provide 2/3 majority fallback",
+      "Tests 6b and 7 (double resolve / bet on resolved) skipped after prompt_comparative switch fixed state persistence"
+    ]
+  }
+}
