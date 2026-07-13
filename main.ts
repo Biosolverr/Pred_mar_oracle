@@ -52,7 +52,7 @@ import { studionet } from "npm:genlayer-js/chains";
 
 // ─── GenLayer Contract / Client Setup ──────────────────────────────
 
-const GL_CONTRACT = "0xce6880203AE90c13016C1CEEAB33dEECED0A871B";
+const GL_CONTRACT = "0xFBedcB13159B8cf515c12709179fa32D25688E53";
 const GL_RPC       = Deno.env.get("GL_RPC_URL") ?? "https://studio.genlayer.com/api";
 const GL_EXPLORER  = "https://explorer-studio.genlayer.com";
 
@@ -524,7 +524,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
         <div class="gl-title">GenLayer Intelligent Contract</div>
         <div class="gl-row">
           <span class="gl-label">Address</span>
-          <span class="gl-val"><a id="gl-addr-link" href="https://explorer-studio.genlayer.com" target="_blank">0xce6880...871B</a></span>
+          <span class="gl-val"><a id="gl-addr-link" href="https://explorer-studio.genlayer.com" target="_blank">${GL_CONTRACT.slice(0,8)}...${GL_CONTRACT.slice(-4)}</a></span>
         </div>
         <div class="gl-row">
           <span class="gl-label">Network</span>
@@ -597,7 +597,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
             </div>
             <div id="d-payouts"></div>
           </div>
-          <div class="agent-note">⚡ This data is read directly from the GenLayer contract's state after resolution — CoinGecko, Binance and the LLM Oracle all run inside the contract across validators, not in this frontend. Contract: <code>0xce6880203AE90c13016C1CEEAB33dEECED0A871B</code></div>
+          <div class="agent-note">⚡ This data is read directly from the GenLayer contract's state after resolution — CoinGecko, Binance and the LLM Oracle all run inside the contract across validators, not in this frontend. Contract: <code>${GL_CONTRACT}</code></div>
         </div>
       </div>
 
