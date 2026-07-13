@@ -895,9 +895,39 @@ Deno.serve(async (req) => {
         question, description, category, rule, resDateSec,
       ]);
 
-      // Sequential id assumption: contract increments market_cnt by 1 per create.
+      // get_market_count() can lag behind an ACCEPTED write (eventual
+      // consistency), which previously caused us to return the id of
+      // the PREVIOUS market instead of the one we just created. Wait
+      // for FINALIZED first to close that window, then confirm we
+      // have the right id by matching the question text — don't just
+      // trust count-1 blindly.
+      let id: number | null = null;
+      try {
+        if (writeClient) {
+          await writeClient.waitForTransactionReceipt({
+            hash: txHash as `0x${string}`,
+            status: "FINALIZED",
+            timeout: 25_000,
+          } as any);
+        }
+      } catch (e) {
+        console.error("Create tx did not reach FINALIZED in time, proceeding with best-effort id lookup:", (e as Error).message);
+      }
+
       const count = await glGetMarketCount();
-      const id = Math.max(0, count - 1);
+      const candidates = [count - 1, count, count - 2].filter((i) => i >= 0);
+      for (const cid of candidates) {
+        try {
+          const raw = await glGetMarketRaw(cid);
+          if (raw && raw.question === question) { id = cid; break; }
+        } catch { /* try next candidate */ }
+      }
+      if (id === null) {
+        // Fallback — best guess, but flag it so the UI/logs know it's unverified.
+        id = Math.max(0, count - 1);
+        console.error(`Could not verify new market id by question match — falling back to count-1 (${id}). Double-check on-chain.`);
+      }
+
       await rememberTx(id, "create", txHash);
       await addLog("market_created_onchain", { id, tx: txHash, question });
 
