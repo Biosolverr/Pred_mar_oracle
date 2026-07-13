@@ -49,7 +49,15 @@ import { studionet } from "npm:genlayer-js/chains";
 
 const GL_CONTRACT = "0xce6880203AE90c13016C1CEEAB33dEECED0A871B";
 const GL_RPC       = Deno.env.get("GL_RPC_URL") ?? "https://studio.genlayer.com/api";
-const GL_PRIVATE_KEY = Deno.env.get("GL_PRIVATE_KEY") ?? ""; // 0x-prefixed hex private key, set in Deno Deploy env vars
+
+// Optional: 0x-prefixed hex private key, set in Deno Deploy env vars.
+// NOT required for studionet — it's a sandbox, so if this is absent
+// we just generate a fresh throwaway account on boot via
+// createAccount() with no args. Studio doesn't require the account to
+// be pre-funded/pre-registered; this is only relevant if you later
+// point GL_RPC_URL at a real network (testnetAsimov) that needs a
+// persistent, funded key.
+const GL_PRIVATE_KEY = Deno.env.get("GL_PRIVATE_KEY") ?? "";
 
 // Contract method names — adjust to match your actual contract if needed.
 const GL_METHOD_CREATE_MARKET     = "create_market";
@@ -64,21 +72,27 @@ const readClient = createClient({
   endpoint: GL_RPC,
 });
 
-// Write client — only created if a private key is configured.
+// Write client — always available on studionet. Uses GL_PRIVATE_KEY
+// if provided, otherwise generates an ephemeral account.
 let writeClient: ReturnType<typeof createClient> | null = null;
 let glAccountAddress: string | null = null;
-if (GL_PRIVATE_KEY) {
-  try {
-    const account = createAccount(GL_PRIVATE_KEY as `0x${string}`);
-    glAccountAddress = account.address;
-    writeClient = createClient({
-      chain: studionet,
-      endpoint: GL_RPC,
-      account,
-    });
-  } catch (e) {
-    console.error("Failed to init GenLayer write account:", (e as Error).message);
-  }
+try {
+  const account = GL_PRIVATE_KEY
+    ? createAccount(GL_PRIVATE_KEY as `0x${string}`)
+    : createAccount(); // ephemeral account, fine for studionet
+  glAccountAddress = account.address;
+  writeClient = createClient({
+    chain: studionet,
+    endpoint: GL_RPC,
+    account,
+  });
+  console.log(
+    GL_PRIVATE_KEY
+      ? `GenLayer write client ready (configured key): ${glAccountAddress}`
+      : `GenLayer write client ready (ephemeral studionet account): ${glAccountAddress}`
+  );
+} catch (e) {
+  console.error("Failed to init GenLayer write account:", (e as Error).message);
 }
 
 async function glRead(fn: string, args: unknown[]): Promise<any> {
@@ -91,7 +105,7 @@ async function glRead(fn: string, args: unknown[]): Promise<any> {
 
 async function glWrite(fn: string, args: unknown[]): Promise<{ txHash: string; receipt: any }> {
   if (!writeClient) {
-    throw new Error("GL_PRIVATE_KEY not configured on the server — running in read-only mode");
+    throw new Error("GenLayer write account failed to initialize on the server — check server logs");
   }
   const txHash = await writeClient.writeContract({
     address: GL_CONTRACT as `0x${string}`,
