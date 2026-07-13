@@ -177,17 +177,33 @@ interface Market {
 }
 
 // ─── KV Storage (local mirror / cache only — NOT source of truth) ──
+//
+// KV is optional. If no KV database is attached to the Deno Deploy
+// project (Settings → KV → Attach/Create database), Deno.openKv()
+// throws — we catch that here so the app still runs and still talks
+// to the contract; you just lose the fast local list cache and the
+// audit log until a KV database is attached.
 
-const kv = await Deno.openKv();
+let kv: Deno.Kv | null = null;
+try {
+  kv = await Deno.openKv();
+} catch (e) {
+  console.error("KV unavailable — running without local cache/log:", (e as Error).message);
+}
 
 async function getMarket(id: number): Promise<Market | null> {
+  if (!kv) return null;
   const r = await kv.get<Market>(["market", id]);
   return r.value ?? null;
 }
 
-async function setMarket(m: Market) { await kv.set(["market", m.id], m); }
+async function setMarket(m: Market) {
+  if (!kv) return;
+  await kv.set(["market", m.id], m);
+}
 
 async function getAllMarkets(): Promise<Market[]> {
+  if (!kv) return [];
   const out: Market[] = [];
   for await (const e of kv.list<Market>({ prefix: ["market"] })) {
     if (typeof e.value?.id === "number") out.push(e.value);
@@ -196,6 +212,7 @@ async function getAllMarkets(): Promise<Market[]> {
 }
 
 async function addLog(action: string, data: Record<string, unknown>) {
+  if (!kv) return;
   const key = ["oracle_log"];
   const r = await kv.get<string[]>(key);
   let logs = r.value ?? [];
@@ -205,6 +222,7 @@ async function addLog(action: string, data: Record<string, unknown>) {
 }
 
 async function getLogs(): Promise<string[]> {
+  if (!kv) return [];
   const r = await kv.get<string[]>(["oracle_log"]);
   return r.value ?? [];
 }
