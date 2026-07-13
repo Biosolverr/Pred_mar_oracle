@@ -1,51 +1,138 @@
 // ══════════════════════════════════════════════════════════════════
 //  Autonomous Prediction Market Oracle  ·  Deno Deploy  ·  main.ts
-//  Stack: Deno KV · Groq · OpenRouter (GPT-OSS-120B + Gemma 4 31B)
 //  GenLayer Intelligent Contract: 0xce6880203AE90c13016C1CEEAB33dEECED0A871B
-//  Flow: Create Market → Place Bets → Resolution Date → 3 Agents
-//        → Majority Consensus → Payout Winners
+//
+//  FIX SUMMARY (vs. previous version)
+//  ───────────────────────────────────────────────────────────────
+//  1. The old glCall() hit /api with method "gen_call" and params
+//     shaped as { to, data: { method, args } }. The GenLayer node
+//     expects params shaped as { Type, Data, from, to, gas, value },
+//     where "Data" is hex-encoded GenLayer calldata (a binary format,
+//     not JSON). Because "Type"/"Data" were missing entirely, the
+//     node threw {"code":-32603,"message":"'type'"}. Hand-rolling
+//     that calldata encoding isn't practical — this is exactly what
+//     the genlayer-js SDK exists for, so all contract I/O now goes
+//     through it (createClient / readContract / writeContract /
+//     waitForTransactionReceipt), matching the pattern already used
+//     in Rojer's other GenLayer frontends.
+//
+//  2. Market creation / betting / resolution used to be a pure local
+//     simulation written straight to Deno KV — the contract was
+//     never actually called for writes. Per the project's own
+//     architecture rule ("no backend intermediary — frontend calls
+//     the contract directly via genlayer-js"), those three actions
+//     now write to the contract on studionet. The contract itself
+//     is responsible for validator consensus (including any
+//     gl.eq_principle.prompt_comparative / nondet resolution logic
+//     it implements internally) — this file no longer runs its own
+//     parallel CoinGecko/Binance/Groq consensus and pretends it's
+//     canonical. Deno KV is now only a local mirror/cache (fast
+//     listing + audit log), always refreshed by reading the chain
+//     after a write.
+//
+//  ⚠ CONTRACT METHOD NAMES / ARG ORDER BELOW ARE BEST-GUESS DEFAULTS
+//    (create_market, place_bet, resolve_market, get_market,
+//    get_market_count). If your deployed Python contract's
+//    @gl.public.write / @gl.public.view method names or argument
+//    order differ, edit the GL_METHOD_* constants and the arg
+//    arrays in glCreateMarket / glPlaceBet / glResolveMarket below
+//    to match. Everything else (routing, KV cache, UI) is unaffected
+//    by that.
 // ══════════════════════════════════════════════════════════════════
 
-const GROQ_API_KEY   = Deno.env.get("GROQ_API_KEY")       ?? "";
-const OPENROUTER_KEY = Deno.env.get("OPENROUTER_API_KEY")  ?? "";
+// deno-lint-ignore-file no-explicit-any
 
-const OR_MODEL_1 = "openai/gpt-oss-120b:free";
-const OR_MODEL_2 = "google/gemma-4-31b-it:free";
+import { createClient, createAccount } from "npm:genlayer-js";
+import { studionet } from "npm:genlayer-js/chains";
 
-// ─── GenLayer Contract ────────────────────────────────────────────
+// ─── GenLayer Contract / Client Setup ──────────────────────────────
 
 const GL_CONTRACT = "0xce6880203AE90c13016C1CEEAB33dEECED0A871B";
-const GL_RPC      = "https://studio.genlayer.com/api";
+const GL_RPC       = Deno.env.get("GL_RPC_URL") ?? "https://studio.genlayer.com/api";
+const GL_PRIVATE_KEY = Deno.env.get("GL_PRIVATE_KEY") ?? ""; // 0x-prefixed hex private key, set in Deno Deploy env vars
 
-async function glCall(method: string, params: unknown[]): Promise<unknown> {
-  const resp = await fetch(GL_RPC, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+// Contract method names — adjust to match your actual contract if needed.
+const GL_METHOD_CREATE_MARKET     = "create_market";
+const GL_METHOD_PLACE_BET         = "place_bet";
+const GL_METHOD_RESOLVE_MARKET    = "resolve_market";
+const GL_METHOD_GET_MARKET        = "get_market";
+const GL_METHOD_GET_MARKET_COUNT  = "get_market_count";
+
+// Read-only client — works even without a private key.
+const readClient = createClient({
+  chain: studionet,
+  endpoint: GL_RPC,
+});
+
+// Write client — only created if a private key is configured.
+let writeClient: ReturnType<typeof createClient> | null = null;
+let glAccountAddress: string | null = null;
+if (GL_PRIVATE_KEY) {
+  try {
+    const account = createAccount(GL_PRIVATE_KEY as `0x${string}`);
+    glAccountAddress = account.address;
+    writeClient = createClient({
+      chain: studionet,
+      endpoint: GL_RPC,
+      account,
+    });
+  } catch (e) {
+    console.error("Failed to init GenLayer write account:", (e as Error).message);
+  }
+}
+
+async function glRead(fn: string, args: unknown[]): Promise<any> {
+  return await readClient.readContract({
+    address: GL_CONTRACT as `0x${string}`,
+    functionName: fn,
+    args,
   });
-  const data = await resp.json();
-  if (data.error) throw new Error(JSON.stringify(data.error));
-  return data.result;
 }
 
-async function glReadContract(fn: string, args: unknown[]): Promise<unknown> {
-  return await glCall("gen_call", [{ to: GL_CONTRACT, data: { method: fn, args } }]);
+async function glWrite(fn: string, args: unknown[]): Promise<{ txHash: string; receipt: any }> {
+  if (!writeClient) {
+    throw new Error("GL_PRIVATE_KEY not configured on the server — running in read-only mode");
+  }
+  const txHash = await writeClient.writeContract({
+    address: GL_CONTRACT as `0x${string}`,
+    functionName: fn,
+    args,
+    value: 0n,
+  });
+  const receipt = await writeClient.waitForTransactionReceipt({
+    hash: txHash,
+    status: "ACCEPTED",
+  });
+  return { txHash, receipt };
 }
 
-async function glGetMarket(id: number): Promise<unknown> {
-  const raw = await glReadContract("get_market", [id]);
-  if (typeof raw === "string") { try { return JSON.parse(raw); } catch { return raw; } }
+async function glGetMarket(id: number): Promise<any> {
+  const raw = await glRead(GL_METHOD_GET_MARKET, [id]);
+  if (typeof raw === "string") {
+    try { return JSON.parse(raw); } catch { return raw; }
+  }
   return raw;
 }
 
 async function glGetMarketCount(): Promise<number> {
-  try { return Number(await glReadContract("get_market_count", []) ?? 0); }
-  catch { return 0; }
+  try {
+    const raw = await glRead(GL_METHOD_GET_MARKET_COUNT, []);
+    return Number(raw ?? 0);
+  } catch {
+    return 0;
+  }
 }
 
 async function glGetContractInfo() {
   const count = await glGetMarketCount();
-  return { contract: GL_CONTRACT, network: "studionet", rpc: GL_RPC, market_count: count };
+  return {
+    contract: GL_CONTRACT,
+    network: "studionet",
+    rpc: GL_RPC,
+    market_count: count,
+    write_mode: !!writeClient,
+    signer: glAccountAddress,
+  };
 }
 
 // ─── Types ────────────────────────────────────────────────────────
@@ -84,17 +171,14 @@ interface Market {
   consensus:       Outcome | null;
   resolved_at:     number;
   created_at:      number;
+  tx_create?:      string;
+  tx_resolve?:     string;
+  on_chain:        boolean;
 }
 
-// ─── KV Storage ───────────────────────────────────────────────────
+// ─── KV Storage (local mirror / cache only — NOT source of truth) ──
 
 const kv = await Deno.openKv();
-
-async function nextId(): Promise<number> {
-  await kv.atomic().mutate({ type: "sum", key: ["mkt_counter"], value: 1n }).commit();
-  const r = await kv.get<bigint>(["mkt_counter"]);
-  return Number(r.value ?? 1n) - 1;
-}
 
 async function getMarket(id: number): Promise<Market | null> {
   const r = await kv.get<Market>(["market", id]);
@@ -125,158 +209,85 @@ async function getLogs(): Promise<string[]> {
   return r.value ?? [];
 }
 
-// ─── Agents ───────────────────────────────────────────────────────
+// ─── Contract-backed operations ────────────────────────────────────
+// Each of these writes to the contract first, then reads the
+// resulting state back from the chain and mirrors it into KV so the
+// UI can list/filter quickly. If the write fails (e.g. no private
+// key configured), the caller gets a clear error instead of a silent
+// local-only fake success.
 
-async function agentCoinGecko(market: Market): Promise<AgentResult> {
-  const agent = "CoinGecko";
-  const source = "https://api.coingecko.com/api/v3/simple/price";
-  if (market.category !== "crypto")
-    return { agent, source, value: "N/A", vote: "INVALID", reason: "Not a crypto market" };
-  try {
-    const q = market.question.toLowerCase();
-    const coinMap: Record<string, string> = {
-      btc: "bitcoin", eth: "ethereum", sol: "solana", bnb: "binancecoin",
-      xrp: "ripple", ada: "cardano", bitcoin: "bitcoin", ethereum: "ethereum", solana: "solana",
-    };
-    const coinId = Object.entries(coinMap).find(([k]) => q.includes(k))?.[1] ?? "bitcoin";
-    const url = `${source}?ids=${coinId}&vs_currencies=usd`;
-    const resp = await fetch(url, { headers: { "Accept": "application/json", "User-Agent": "PredictionOracle/1.0" } });
-    const data = await resp.json();
-    const price = data?.[coinId]?.usd ?? 0;
-    const vote = evaluateRule(market.resolution_rule, price);
-    return { agent, source: url, value: `$${price.toLocaleString()}`, vote, reason: `Price = $${price.toLocaleString()}` };
-  } catch (e) {
-    return { agent, source, value: "error", vote: "INVALID", reason: `Fetch failed: ${e.message}` };
-  }
-}
+async function glCreateMarket(input: {
+  creator: string; question: string; description: string;
+  category: string; resolution_rule: string; resolution_date: number;
+}): Promise<{ id: number; market: Market; txHash: string }> {
+  const { txHash } = await glWrite(GL_METHOD_CREATE_MARKET, [
+    input.question,
+    input.description,
+    input.category,
+    input.resolution_rule,
+    input.resolution_date,
+  ]);
 
-async function agentBinance(market: Market): Promise<AgentResult> {
-  const agent = "Binance";
-  const source = "https://api.binance.com/api/v3/ticker/price";
-  if (market.category !== "crypto")
-    return { agent, source, value: "N/A", vote: "INVALID", reason: "Not a crypto market" };
-  try {
-    const q = market.question.toLowerCase();
-    const symbolMap: Record<string, string> = {
-      btc: "BTCUSDT", eth: "ETHUSDT", sol: "SOLUSDT", bnb: "BNBUSDT",
-      xrp: "XRPUSDT", ada: "ADAUSDT", bitcoin: "BTCUSDT", ethereum: "ETHUSDT", solana: "SOLUSDT",
-    };
-    const symbol = Object.entries(symbolMap).find(([k]) => q.includes(k))?.[1] ?? "BTCUSDT";
-    const url = `${source}?symbol=${symbol}`;
-    const resp = await fetch(url, { headers: { "User-Agent": "PredictionOracle/1.0" } });
-    const data = await resp.json();
-    const price = parseFloat(data?.price ?? "0");
-    const vote = evaluateRule(market.resolution_rule, price);
-    return { agent, source: url, value: `$${price.toLocaleString()}`, vote, reason: `Price = $${price.toLocaleString()}` };
-  } catch (e) {
-    return { agent, source, value: "error", vote: "INVALID", reason: `Fetch failed: ${e.message}` };
-  }
-}
+  // Assumes the contract assigns sequential ids and market_count
+  // reflects the new total after the write is finalized.
+  const count = await glGetMarketCount();
+  const id = Math.max(0, count - 1);
 
-async function agentLLM(market: Market, liveData?: string): Promise<AgentResult> {
-  const agent = "LLM Oracle";
-  const dataSection = liveData ? "LIVE MARKET DATA (fetched right now from public APIs):\n" + liveData + "\n" : "";
-  const prompt =
-    "You are a strict prediction market resolver. You MUST use the live data provided below.\n\n" +
-    (dataSection ? "=== LIVE DATA (USE THIS, IGNORE YOUR TRAINING) ===\n" + dataSection + "=== END LIVE DATA ===\n\n" : "") +
-    'QUESTION: "' + market.question + '"\nRULE: "' + market.resolution_rule + '"\n\n' +
-    "INSTRUCTIONS:\n- Apply the rule to the live data price.\n- Ignore training data prices.\n" +
-    '- Reply with ONLY this JSON:\n{"vote":"YES","value":"price","reason":"brief"}\nor\n{"vote":"NO","value":"price","reason":"brief"}';
+  let chainMarket: any = null;
+  try { chainMarket = await glGetMarket(id); } catch { /* fall through to local mirror */ }
 
-  if (GROQ_API_KEY) {
-    try {
-      const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
-        body: JSON.stringify({ model: "llama-3.1-8b-instant", messages: [{ role: "user", content: prompt }], max_tokens: 200, temperature: 0.0 }),
-      });
-      const data = await resp.json();
-      return parseLLMResponse(agent, "groq/llama-3.1-8b-instant", data?.choices?.[0]?.message?.content ?? "");
-    } catch { /* fallthrough */ }
-  }
-
-  if (OPENROUTER_KEY) {
-    for (const model of [OR_MODEL_1, OR_MODEL_2]) {
-      try {
-        const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENROUTER_KEY}`, "HTTP-Referer": "https://prediction-oracle.deno.net" },
-          body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], max_tokens: 200 }),
-        });
-        const data = await resp.json();
-        return parseLLMResponse(agent, model, data?.choices?.[0]?.message?.content ?? "");
-      } catch { /* try next */ }
-    }
-  }
-
-  return { agent, source: "no-key", value: "error", vote: "INVALID", reason: "No LLM API key configured" };
-}
-
-function parseLLMResponse(agent: string, source: string, text: string): AgentResult {
-  try {
-    const clean = text.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(clean);
-    const vote = (parsed.vote === "YES" || parsed.vote === "NO") ? parsed.vote : "INVALID";
-    return { agent, source, value: parsed.value ?? "unknown", vote, reason: parsed.reason ?? "LLM decision" };
-  } catch {
-    if (text.toUpperCase().includes("YES")) return { agent, source, value: text, vote: "YES", reason: "LLM said YES" };
-    if (text.toUpperCase().includes("NO"))  return { agent, source, value: text, vote: "NO",  reason: "LLM said NO" };
-    return { agent, source, value: text, vote: "INVALID", reason: "Could not parse LLM response" };
-  }
-}
-
-// ─── Resolution Logic ──────────────────────────────────────────────
-
-function evaluateRule(rule: string, value: number): Outcome {
-  try {
-    const m = rule.match(/(>=|<=|>|<|==)\s*\$?([\d,]+\.?\d*)/);
-    if (!m) return "INVALID";
-    const op = m[1], tgt = parseFloat(m[2].replace(/,/g, ""));
-    if (op === ">"  && value >  tgt) return "YES";
-    if (op === ">=" && value >= tgt) return "YES";
-    if (op === "<"  && value <  tgt) return "YES";
-    if (op === "<=" && value <= tgt) return "YES";
-    if (op === "==" && Math.abs(value - tgt) < 0.01) return "YES";
-    return "NO";
-  } catch { return "INVALID"; }
-}
-
-function majorityVote(results: AgentResult[]): Outcome {
-  const valid = results.filter(r => r.vote !== "INVALID");
-  if (valid.length < 2) return "INVALID";
-  const yes = valid.filter(r => r.vote === "YES").length;
-  const no  = valid.filter(r => r.vote === "NO").length;
-  if (yes >= 2) return "YES";
-  if (no  >= 2) return "NO";
-  return "INVALID";
-}
-
-async function runResolution(market: Market): Promise<Market> {
-  market.status = "resolving";
-  await setMarket(market);
-  await addLog("resolution_started", { id: market.id, question: market.question });
-
-  let results: AgentResult[];
-
-  if (market.category === "crypto") {
-    const [r1, r2] = await Promise.all([agentCoinGecko(market), agentBinance(market)]);
-    const liveData = [r1, r2].filter(r => r.vote !== "INVALID")
-      .map(r => `${r.agent}: ${r.value} (source: ${r.source})`).join("\n");
-    const r3 = await agentLLM(market, liveData || undefined);
-    results = [r1, r2, r3];
-  } else {
-    const [r1, r2, r3] = await Promise.all([agentLLM(market), agentLLM(market), agentLLM(market)]);
-    results = [r1, r2, r3];
-  }
-
-  const consensus = majorityVote(results);
-  market.agent_results = results;
-  market.consensus     = consensus;
-  market.status        = "resolved";
-  market.resolved_at   = Date.now();
+  const now = Date.now();
+  const market: Market = {
+    id,
+    creator: input.creator,
+    question: input.question,
+    description: input.description,
+    category: input.category as Market["category"],
+    resolution_date: input.resolution_date,
+    resolution_rule: input.resolution_rule,
+    yes_pool: chainMarket?.yes_pool ?? 0,
+    no_pool: chainMarket?.no_pool ?? 0,
+    bets: chainMarket?.bets ?? [],
+    status: (chainMarket?.status as MarketStatus) ?? "open",
+    agent_results: chainMarket?.agent_results ?? [],
+    consensus: chainMarket?.consensus ?? null,
+    resolved_at: chainMarket?.resolved_at ?? 0,
+    created_at: now,
+    tx_create: txHash,
+    on_chain: true,
+  };
 
   await setMarket(market);
-  await addLog("resolution_complete", { id: market.id, votes: results.map(r => r.vote), consensus, prices: results.map(r => r.value) });
+  await addLog("market_created_onchain", { id, tx: txHash, question: input.question });
+  return { id, market, txHash };
+}
+
+async function glSyncMarketFromChain(id: number): Promise<Market | null> {
+  const chainMarket: any = await glGetMarket(id);
+  if (!chainMarket) return null;
+
+  const existing = await getMarket(id);
+  const market: Market = {
+    id,
+    creator: chainMarket.creator ?? existing?.creator ?? "",
+    question: chainMarket.question ?? existing?.question ?? "",
+    description: chainMarket.description ?? existing?.description ?? "",
+    category: chainMarket.category ?? existing?.category ?? "custom",
+    resolution_date: chainMarket.resolution_date ?? existing?.resolution_date ?? 0,
+    resolution_rule: chainMarket.resolution_rule ?? existing?.resolution_rule ?? "",
+    yes_pool: chainMarket.yes_pool ?? existing?.yes_pool ?? 0,
+    no_pool: chainMarket.no_pool ?? existing?.no_pool ?? 0,
+    bets: chainMarket.bets ?? existing?.bets ?? [],
+    status: chainMarket.status ?? existing?.status ?? "open",
+    agent_results: chainMarket.agent_results ?? existing?.agent_results ?? [],
+    consensus: chainMarket.consensus ?? existing?.consensus ?? null,
+    resolved_at: chainMarket.resolved_at ?? existing?.resolved_at ?? 0,
+    created_at: existing?.created_at ?? Date.now(),
+    tx_create: existing?.tx_create,
+    tx_resolve: existing?.tx_resolve,
+    on_chain: true,
+  };
+  await setMarket(market);
   return market;
 }
 
@@ -398,6 +409,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
 .gl-ok{background:#f0fdf4;color:var(--green);border:1px solid #bbf7d0}
 .gl-err{background:#fff1f2;color:var(--red);border:1px solid #fecdd3}
 .gl-loading{background:#f5f3ff;color:var(--accent);border:1px solid #ddd6fe}
+.gl-warn{background:#fffbeb;color:var(--yellow);border:1px solid #fde68a}
 </style>
 </head>
 <body>
@@ -406,7 +418,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
   <div class="logo">
     <div class="logo-icon">🔮</div>
     <h1>Prediction Oracle</h1>
-    <span class="tag">Multi-Agent Consensus</span>
+    <span class="tag">On-Chain Consensus</span>
     <a href="https://genlayer.com" target="_blank" style="font-size:11px;color:var(--accent);text-decoration:none;padding:2px 10px;border-radius:20px;border:1px solid rgba(124,58,237,.2);background:rgba(124,58,237,.06);font-weight:500">Powered by GenLayer ↗</a>
   </div>
   <div class="stats">
@@ -421,7 +433,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
 
     <!-- Create Market -->
     <div class="panel">
-      <div class="panel-title">Create Market</div>
+      <div class="panel-title">Create Market (writes to contract)</div>
       <label>Your address</label>
       <input id="c-creator" value="web" placeholder="your_address"/>
       <label>Question</label>
@@ -439,13 +451,13 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
       <input id="c-rule" placeholder='price > $100000'/>
       <label>Resolution date (UTC)</label>
       <input id="c-date" type="datetime-local"/>
-      <button class="btn" onclick="createMarket()">Create Market</button>
+      <button class="btn" onclick="createMarket()">Create Market on GenLayer</button>
       <div id="c-msg"></div>
     </div>
 
     <!-- Place Bet -->
     <div class="panel">
-      <div class="panel-title">Place Bet</div>
+      <div class="panel-title">Place Bet (writes to contract)</div>
       <label>Market ID</label>
       <input id="b-id" type="number" placeholder="0"/>
       <label>Bettor address</label>
@@ -455,9 +467,9 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
         <div class="pos-btn pos-yes active" id="pos-yes" onclick="selectPos('YES')">✅ YES</div>
         <div class="pos-btn pos-no" id="pos-no" onclick="selectPos('NO')">❌ NO</div>
       </div>
-      <label>Amount (ETH)</label>
+      <label>Amount</label>
       <input id="b-amount" type="number" step="0.001" placeholder="0.01"/>
-      <button class="btn" onclick="placeBet()">Place Bet</button>
+      <button class="btn" onclick="placeBet()">Place Bet on GenLayer</button>
       <div id="b-msg"></div>
     </div>
 
@@ -468,7 +480,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
       <input id="r-id" type="number" placeholder="0"/>
       <label>Caller address</label>
       <input id="r-caller" value="web" placeholder="your_address"/>
-      <button class="btn" id="r-btn" onclick="resolveMarket()">🤖 Run 3-Agent Consensus</button>
+      <button class="btn" id="r-btn" onclick="resolveMarket()">🤖 Trigger On-Chain Resolution</button>
       <div id="r-msg"></div>
 
       <div class="divider"></div>
@@ -487,6 +499,10 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
         <div class="gl-row">
           <span class="gl-label">Markets on-chain</span>
           <span class="gl-val" id="gl-count"><span class="gl-status gl-loading">loading...</span></span>
+        </div>
+        <div class="gl-row">
+          <span class="gl-label">Write mode</span>
+          <span class="gl-val" id="gl-write-mode"><span class="gl-status gl-loading">checking...</span></span>
         </div>
         <div class="gl-row">
           <span class="gl-label">RPC status</span>
@@ -535,16 +551,16 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
         </div>
 
         <div id="d-agents-section" style="display:none;margin-top:16px">
-          <div class="panel-title" style="margin-bottom:8px">Agent votes — 3 independent sources → majority</div>
+          <div class="panel-title" style="margin-bottom:8px">Agent votes (from contract state)</div>
           <div class="agents" id="d-agents"></div>
           <div class="consensus">
             <div>
-              <div style="font-size:12px;color:var(--muted)">Consensus (2 of 3)</div>
+              <div style="font-size:12px;color:var(--muted)">Consensus</div>
               <div style="font-size:22px;font-weight:800;margin-top:2px" id="d-consensus"></div>
             </div>
             <div id="d-payouts"></div>
           </div>
-          <div class="agent-note">⚡ Resolution logic mirrors the deployed GenLayer intelligent contract — CoinGecko &amp; Binance fetch live prices independently, LLM uses them as ground truth via <code>gl.eq_principle.prompt_comparative</code>. Contract: <code>0xce6880203AE90c13016C1CEEAB33dEECED0A871B</code></div>
+          <div class="agent-note">⚡ This data is read directly from the GenLayer contract's state after resolution — it is not computed by this frontend. Contract: <code>0xce6880203AE90c13016C1CEEAB33dEECED0A871B</code></div>
         </div>
 
         <!-- GenLayer on-chain state -->
@@ -585,7 +601,7 @@ function $(id){return document.getElementById(id)}
 function badge(st){return '<span class="badge st-'+st+'">'+st+'</span>'}
 function pill(v){const c=v==='YES'?'yes':v==='NO'?'no':'invalid';return '<span class="pill pill-'+c+'">'+v+'</span>';}
 function fmt(ts){if(!ts||ts===0)return'—';return new Date(ts).toLocaleString()}
-function fmtEth(n){return(+n||0).toFixed(4)+' ETH'}
+function fmtEth(n){return(+n||0).toFixed(4)}
 function showToast(msg,type='ok'){const t=$('toast');t.textContent=msg;t.className='toast '+type+' show';setTimeout(()=>t.classList.remove('show'),4000);}
 function setMsg(id,msg,ok){$(id).innerHTML=msg;$(id).className='msg '+(ok?'ok':'err');}
 function selectPos(p){selectedPos=p;$('pos-yes').classList.toggle('active',p==='YES');$('pos-no').classList.toggle('active',p==='NO');}
@@ -594,6 +610,7 @@ function poolBar(m){const t=m.yes_pool+m.no_pool;if(!t)return'';const y=Math.rou
 async function loadGLInfo(){
   $('gl-rpc-status').innerHTML='<span class="gl-status gl-loading">checking...</span>';
   $('gl-count').innerHTML='<span class="gl-status gl-loading">loading...</span>';
+  $('gl-write-mode').innerHTML='<span class="gl-status gl-loading">checking...</span>';
   try{
     const r=await fetch('/api/gl/info');
     const d=await r.json();
@@ -602,9 +619,13 @@ async function loadGLInfo(){
     $('gl-addr-link').href='https://explorer-studio.genlayer.com/address/'+d.contract;
     $('gl-count').innerHTML='<b>'+d.market_count+'</b>';
     $('gl-rpc-status').innerHTML='<span class="gl-status gl-ok">✓ connected</span>';
+    $('gl-write-mode').innerHTML=d.write_mode
+      ? '<span class="gl-status gl-ok">✓ enabled ('+(d.signer?d.signer.slice(0,10)+'...':'')+')</span>'
+      : '<span class="gl-status gl-warn">read-only (no GL_PRIVATE_KEY)</span>';
   }catch(e){
     $('gl-rpc-status').innerHTML='<span class="gl-status gl-err">✗ '+e.message+'</span>';
     $('gl-count').innerHTML='<span class="gl-status gl-err">—</span>';
+    $('gl-write-mode').innerHTML='<span class="gl-status gl-err">—</span>';
   }
 }
 
@@ -623,47 +644,47 @@ async function loadGLMarket(id){
 }
 
 async function createMarket(){
-  const btn=event.target;btn.disabled=true;
+  const btn=event.target;btn.disabled=true;btn.textContent='⏳ Writing to contract...';
   try{
     const r=await fetch('/api/markets/create',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({creator:$('c-creator').value||'web',question:$('c-question').value,
         description:$('c-desc').value,category:$('c-category').value,resolution_rule:$('c-rule').value,
         resolution_date:new Date($('c-date').value).getTime()||Date.now()+86400000})});
     const d=await r.json();
-    if(d.success){setMsg('c-msg','✅ Market #'+d.market_id+' created',true);showToast('Market #'+d.market_id+' created');loadList();loadStats();loadLogs();}
+    if(d.success){setMsg('c-msg','✅ Market #'+d.market_id+' created on-chain (tx '+d.tx_hash.slice(0,10)+'...)',true);showToast('Market #'+d.market_id+' created');loadList();loadStats();loadLogs();}
     else{setMsg('c-msg','❌ '+(d.error||'Failed'),false);showToast(d.error||'Failed','err');}
   }catch(e){setMsg('c-msg','❌ '+e.message,false);}
-  btn.disabled=false;
+  btn.disabled=false;btn.textContent='Create Market on GenLayer';
 }
 
 async function placeBet(){
-  const btn=event.target;btn.disabled=true;
+  const btn=event.target;btn.disabled=true;btn.textContent='⏳ Writing to contract...';
   try{
     const id=$('b-id').value;
     const r=await fetch('/api/markets/'+id+'/bet',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({bettor:$('b-bettor').value||'web',position:selectedPos,amount:parseFloat($('b-amount').value)||0.1})});
     const d=await r.json();
-    if(d.success){setMsg('b-msg','✅ Bet: '+selectedPos+' on #'+id,true);showToast('Bet placed');loadList();loadLogs();}
+    if(d.success){setMsg('b-msg','✅ Bet: '+selectedPos+' on #'+id+' (tx '+d.tx_hash.slice(0,10)+'...)',true);showToast('Bet placed');loadList();loadLogs();}
     else{setMsg('b-msg','❌ '+(d.error||'Failed'),false);showToast(d.error||'Failed','err');}
   }catch(e){setMsg('b-msg','❌ '+e.message,false);}
-  btn.disabled=false;
+  btn.disabled=false;btn.textContent='Place Bet on GenLayer';
 }
 
 async function resolveMarket(){
-  const btn=$('r-btn');btn.disabled=true;btn.textContent='⏳ Running agents...';
+  const btn=$('r-btn');btn.disabled=true;btn.textContent='⏳ Waiting for validator consensus...';
   try{
     const id=$('r-id').value;
-    showToast('Starting resolution for #'+id+'...');
+    showToast('Triggering on-chain resolution for #'+id+'...');
     const r=await fetch('/api/markets/'+id+'/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({caller:$('r-caller').value||'web'})});
     const d=await r.json();
     if(d.success){
-      setMsg('r-msg','✅ Consensus: '+d.consensus+' ('+d.votes.join(' / ')+')',true);
+      setMsg('r-msg','✅ Consensus: '+d.consensus+' (tx '+d.tx_hash.slice(0,10)+'...)',true);
       showToast('Resolved: '+d.consensus);loadList();loadStats();loadLogs();
       setTimeout(()=>inspectMarket(id),400);
     }else{setMsg('r-msg','❌ '+(d.error||'Failed'),false);showToast(d.error||'Failed','err');}
   }catch(e){setMsg('r-msg','❌ '+e.message,false);}
-  btn.disabled=false;btn.textContent='🤖 Run 3-Agent Consensus';
+  btn.disabled=false;btn.textContent='🤖 Trigger On-Chain Resolution';
 }
 
 function renderItem(m){
@@ -671,7 +692,7 @@ function renderItem(m){
   const d=new Date(m.resolution_date).toLocaleDateString();
   return '<div class="mkt-item" onclick="inspectMarket('+m.id+')">'+
     '<div class="mid">#'+m.id+'</div>'+
-    '<div class="minfo"><div class="mq">'+m.question+'</div><div class="mm">'+m.category+' · pool: '+p+' ETH · '+d+'</div></div>'+
+    '<div class="minfo"><div class="mq">'+m.question+'</div><div class="mm">'+m.category+' · pool: '+p+' · '+d+'</div></div>'+
     '<div class="mside">'+badge(m.status)+poolBar(m)+'</div></div>';
 }
 
@@ -708,9 +729,11 @@ async function inspectMarket(id){
     g+='<div class="dlabel">Category</div><div class="dval">'+m.category+'</div>';
     g+='<div class="dlabel">Resolution rule</div><div class="dval">'+m.resolution_rule+'</div>';
     g+='<div class="dlabel">Resolution date</div><div class="dval">'+fmt(m.resolution_date)+'</div>';
-    g+='<div class="dlabel">Total pool</div><div class="dval">'+total+' ETH (YES: '+m.yes_pool.toFixed(4)+' / NO: '+m.no_pool.toFixed(4)+')</div>';
+    g+='<div class="dlabel">Total pool</div><div class="dval">'+total+' (YES: '+m.yes_pool.toFixed(4)+' / NO: '+m.no_pool.toFixed(4)+')</div>';
     g+='<div class="dlabel">Created</div><div class="dval">'+fmt(m.created_at)+'</div>';
     g+='<div class="dlabel">Resolved</div><div class="dval">'+fmt(m.resolved_at)+'</div>';
+    if(m.tx_create)g+='<div class="dlabel">Create tx</div><div class="dval">'+m.tx_create+'</div>';
+    if(m.tx_resolve)g+='<div class="dlabel">Resolve tx</div><div class="dval">'+m.tx_resolve+'</div>';
     $('d-grid').innerHTML=g;
     if(m.bets&&m.bets.length){
       $('d-bets-section').style.display='block';
@@ -719,13 +742,13 @@ async function inspectMarket(id){
     if(m.agent_results&&m.agent_results.length){
       $('d-agents-section').style.display='block';
       $('d-agents').innerHTML=m.agent_results.map(a=>
-        '<div class="agent-card voted-'+a.vote.toLowerCase()+'">'+
+        '<div class="agent-card voted-'+(a.vote||'invalid').toLowerCase()+'">'+
         '<div class="a-name">'+a.agent+'</div><div class="a-val">'+a.value+'</div>'+
-        '<div>'+pill(a.vote)+'</div><div class="a-reason">'+a.reason+'</div>'+
-        '<div class="a-src">'+a.source+'</div></div>').join('');
+        '<div>'+pill(a.vote)+'</div><div class="a-reason">'+(a.reason||'')+'</div>'+
+        '<div class="a-src">'+(a.source||'')+'</div></div>').join('');
       $('d-consensus').innerHTML=pill(m.consensus||'?');
       const wPool=m.consensus==='YES'?m.yes_pool:m.no_pool;
-      $('d-payouts').innerHTML='<div style="font-size:12px;color:var(--muted)">Winner pool</div><div style="font-size:15px;font-weight:700">'+wPool.toFixed(4)+' / '+total+' ETH</div>';
+      $('d-payouts').innerHTML='<div style="font-size:12px;color:var(--muted)">Winner pool</div><div style="font-size:15px;font-weight:700">'+wPool.toFixed(4)+' / '+total+'</div>';
     }else{$('d-agents-section').style.display='none';}
     loadGLMarket(id);
     $('detail').scrollIntoView({behavior:'smooth',block:'nearest'});
@@ -765,7 +788,7 @@ Deno.serve(async (req) => {
   const path = url.pathname;
 
   if (req.method === "OPTIONS") return new Response(null, { headers: cors() });
-  if (path === "/health") return json({ ok: true, ts: Date.now() });
+  if (path === "/health") return json({ ok: true, ts: Date.now(), write_mode: !!writeClient });
 
   if (path === "/" || path === "") {
     return new Response(html(), { headers: cors({ "Content-Type": "text/html;charset=utf-8" }) });
@@ -777,7 +800,7 @@ Deno.serve(async (req) => {
     try {
       return json(await glGetContractInfo());
     } catch (e) {
-      return json({ error: e.message, contract: GL_CONTRACT, network: "studionet" });
+      return json({ error: (e as Error).message, contract: GL_CONTRACT, network: "studionet" });
     }
   }
 
@@ -787,7 +810,7 @@ Deno.serve(async (req) => {
       const data = await glGetMarket(Number(mGL[1]));
       return json({ source: "genlayer_contract", contract: GL_CONTRACT, network: "studionet", data });
     } catch (e) {
-      return json({ error: e.message });
+      return json({ error: (e as Error).message });
     }
   }
 
@@ -813,7 +836,15 @@ Deno.serve(async (req) => {
 
   const mGet = path.match(/^\/api\/markets\/(\d+)$/);
   if (mGet && req.method === "GET") {
-    const m = await getMarket(Number(mGet[1]));
+    const id = Number(mGet[1]);
+    // Prefer chain state; fall back to KV cache if the read fails.
+    try {
+      const synced = await glSyncMarketFromChain(id);
+      if (synced) return json(synced);
+    } catch (e) {
+      console.error("chain read failed, falling back to KV cache:", (e as Error).message);
+    }
+    const m = await getMarket(id);
     return json(m ?? { error: "Market not found" });
   }
 
@@ -832,20 +863,13 @@ Deno.serve(async (req) => {
       if (!rule)                  return json({ success: false, error: "Resolution rule required" }, 400);
       if (resDate <= Date.now())  return json({ success: false, error: "Resolution date must be in the future" }, 400);
 
-      const id  = await nextId();
-      const now = Date.now();
-      const market: Market = {
-        id, creator, question, description, category,
-        resolution_date: resDate, resolution_rule: rule,
-        yes_pool: 0, no_pool: 0, bets: [], status: "open",
-        agent_results: [], consensus: null, resolved_at: 0, created_at: now,
-      };
+      const { id, txHash } = await glCreateMarket({
+        creator, question, description, category, resolution_rule: rule, resolution_date: resDate,
+      });
 
-      await setMarket(market);
-      await addLog("market_created", { id, creator, question, category, resDate });
-      return json({ success: true, market_id: id });
+      return json({ success: true, market_id: id, tx_hash: txHash });
     } catch (e) {
-      return json({ success: false, error: e.message }, 500);
+      return json({ success: false, error: (e as Error).message }, 500);
     }
   }
 
@@ -854,24 +878,18 @@ Deno.serve(async (req) => {
     try {
       const id = Number(mBet[1]);
       const b  = await req.json();
-      const m  = await getMarket(id);
-
-      if (!m)                     return json({ success: false, error: "Market not found" }, 404);
-      if (m.status !== "open")    return json({ success: false, error: "Market is not open for betting" }, 400);
-      if (m.resolution_date <= Date.now()) return json({ success: false, error: "Market past resolution date" }, 400);
 
       const bettor   = (b.bettor ?? "web").trim();
       const position = b.position === "NO" ? "NO" : "YES";
       const amount   = Math.max(0.001, parseFloat(b.amount) || 0.1);
 
-      m.bets.push({ bettor, position, amount, placed_at: Date.now() });
-      if (position === "YES") m.yes_pool += amount; else m.no_pool += amount;
+      const { txHash } = await glWrite(GL_METHOD_PLACE_BET, [id, position, amount]);
+      await glSyncMarketFromChain(id);
+      await addLog("bet_placed_onchain", { market_id: id, bettor, position, amount, tx: txHash });
 
-      await setMarket(m);
-      await addLog("bet_placed", { market_id: id, bettor, position, amount });
-      return json({ success: true });
+      return json({ success: true, tx_hash: txHash });
     } catch (e) {
-      return json({ success: false, error: e.message }, 500);
+      return json({ success: false, error: (e as Error).message }, 500);
     }
   }
 
@@ -880,22 +898,29 @@ Deno.serve(async (req) => {
     try {
       const id = Number(mRes[1]);
       const b  = await req.json().catch(() => ({}));
-      let m    = await getMarket(id);
-
-      if (!m)                        return json({ success: false, error: "Market not found" }, 404);
-      if (m.status === "resolved")   return json({ success: false, error: "Market already resolved" }, 400);
-      if (m.status === "resolving")  return json({ success: false, error: "Resolution already in progress" }, 400);
-
       const caller = (b.caller ?? "").trim();
       if (!caller) return json({ success: false, error: "Caller address required" }, 400);
 
-      m.status = "locked";
-      await setMarket(m);
-      m = await runResolution(m);
+      // This triggers the contract's own resolution logic on studionet —
+      // validator consensus (and any nondet/LLM comparison the contract
+      // implements) happens inside the GenVM, not in this backend.
+      const { txHash } = await glWrite(GL_METHOD_RESOLVE_MARKET, [id]);
+      const market = await glSyncMarketFromChain(id);
+      if (market) {
+        market.tx_resolve = txHash;
+        await setMarket(market);
+      }
 
-      return json({ success: true, consensus: m.consensus, votes: m.agent_results.map(r => r.vote), agent_details: m.agent_results });
+      await addLog("resolution_onchain", { id, tx: txHash, consensus: market?.consensus });
+
+      return json({
+        success: true,
+        tx_hash: txHash,
+        consensus: market?.consensus ?? null,
+        agent_details: market?.agent_results ?? [],
+      });
     } catch (e) {
-      return json({ success: false, error: e.message }, 500);
+      return json({ success: false, error: (e as Error).message }, 500);
     }
   }
 
