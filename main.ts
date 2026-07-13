@@ -931,6 +931,28 @@ Deno.serve(async (req) => {
     try {
       const id = Number(mRes[1]);
 
+      // Pre-flight check: read the market first so we don't burn a
+      // transaction on an attempt that's guaranteed to come back
+      // UNRESOLVED (or fail) because the resolution date hasn't
+      // passed yet, or the market was already resolved.
+      const preRaw = await glGetMarketRaw(id);
+      const preMarket = normalizeMarket(id, preRaw);
+
+      if (!preMarket) {
+        return json({ success: false, error: "Market not found" }, 404);
+      }
+      if (preMarket.status === "resolved" && preMarket.consensus !== "UNRESOLVED") {
+        return json({ success: false, error: "Market is already resolved (consensus: " + preMarket.consensus + ")" }, 400);
+      }
+      if (preMarket.resolution_date > Date.now()) {
+        const eta = new Date(preMarket.resolution_date).toISOString();
+        return json({
+          success: false,
+          error: `Resolution date hasn't passed yet (${eta}). Wait until then before resolving.`,
+          resolution_date: preMarket.resolution_date,
+        }, 400);
+      }
+
       // Runs the contract's own multi-agent consensus (CoinGecko +
       // Binance + LLM Oracle, gl.eq_principle.prompt_comparative)
       // inside GenVM across validators — nothing computed here.
