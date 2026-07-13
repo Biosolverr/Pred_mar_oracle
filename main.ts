@@ -822,6 +822,20 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: cors() });
   if (path === "/health") return json({ ok: true, ts: Date.now(), write_mode: !!writeClient });
 
+  // Manual kill switch for the local KV cache/audit log, independent
+  // of the auto-clear-on-contract-change logic. Protect with
+  // ADMIN_KEY env var so randoms can't wipe it. Usage:
+  //   GET /api/admin/wipe-cache?key=YOUR_ADMIN_KEY
+  if (path === "/api/admin/wipe-cache" && req.method === "GET") {
+    const adminKey = Deno.env.get("ADMIN_KEY") ?? "";
+    if (!adminKey) return json({ error: "Set ADMIN_KEY env var on the server to enable this endpoint" }, 403);
+    if (url.searchParams.get("key") !== adminKey) return json({ error: "Invalid key" }, 403);
+    if (!kv) return json({ error: "KV not available" }, 500);
+    let deleted = 0;
+    for await (const entry of kv.list({ prefix: [] })) { await kv.delete(entry.key); deleted++; }
+    return json({ ok: true, deleted });
+  }
+
   if (path === "/" || path === "") {
     return new Response(html(), { headers: cors({ "Content-Type": "text/html;charset=utf-8" }) });
   }
