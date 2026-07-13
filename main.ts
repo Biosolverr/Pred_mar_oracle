@@ -1,6 +1,6 @@
 // ══════════════════════════════════════════════════════════════════
 //  Autonomous Prediction Market Oracle  ·  Deno Deploy  ·  main.ts
-//  GenLayer Intelligent Contract: 0xce6880203AE90c13016C1CEEAB33dEECED0A871B
+//  GenLayer Intelligent Contract: 0xFBedcB13159B8cf515c12709179fa32D25688E53
 //
 //  This version is aligned field-for-field against the deployed
 //  PredictionMarketOracle contract (see contract source for
