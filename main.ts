@@ -1,6 +1,6 @@
 // ══════════════════════════════════════════════════════════════════
 //  Autonomous Prediction Market Oracle  ·  Deno Deploy  ·  main.ts
-//  GenLayer Intelligent Contract: 0xFBedcB13159B8cf515c12709179fa32D25688E53
+//  GenLayer Intelligent Contract: 0xce6880203AE90c13016C1CEEAB33dEECED0A871B
 //
 //  This version is aligned field-for-field against the deployed
 //  PredictionMarketOracle contract (see contract source for
@@ -264,9 +264,28 @@ try {
   console.error("KV unavailable — audit log will be empty, everything else still works:", (e as Error).message);
 }
 
+// Everything cached in KV is scoped under the current contract address.
+// If GL_CONTRACT changes (redeploy to a fresh contract), the old cache
+// is orphaned — new market ids restart at 0 on-chain, but stale KV
+// entries under the old contract's ids/log would otherwise bleed
+// through and look like leftover history. Detect that here and wipe
+// automatically so a redeploy always starts clean.
+const KV_NS = ["ns", GL_CONTRACT] as const;
+
+if (kv) {
+  const activeContractKey = ["meta", "active_contract"];
+  const r = await kv.get<string>(activeContractKey);
+  if (r.value && r.value !== GL_CONTRACT) {
+    console.log(`Contract address changed (${r.value} -> ${GL_CONTRACT}) — clearing local KV cache/log.`);
+    for await (const entry of kv.list({ prefix: ["tx"] })) await kv.delete(entry.key);
+    for await (const entry of kv.list({ prefix: ["oracle_log"] })) await kv.delete(entry.key);
+  }
+  await kv.set(activeContractKey, GL_CONTRACT);
+}
+
 async function addLog(action: string, data: Record<string, unknown>) {
   if (!kv) return;
-  const key = ["oracle_log"];
+  const key = [...KV_NS, "oracle_log"];
   const r = await kv.get<string[]>(key);
   let logs = r.value ?? [];
   logs.push(JSON.stringify({ t: Date.now(), action, data }));
@@ -276,7 +295,7 @@ async function addLog(action: string, data: Record<string, unknown>) {
 
 async function getLogs(): Promise<string[]> {
   if (!kv) return [];
-  const r = await kv.get<string[]>(["oracle_log"]);
+  const r = await kv.get<string[]>([...KV_NS, "oracle_log"]);
   return r.value ?? [];
 }
 
@@ -284,13 +303,13 @@ async function getLogs(): Promise<string[]> {
 // doesn't store these) — falls back to empty if KV is unavailable.
 async function rememberTx(id: number, kind: "create" | "resolve", txHash: string) {
   if (!kv) return;
-  await kv.set(["tx", id, kind], txHash);
+  await kv.set([...KV_NS, "tx", id, kind], txHash);
 }
 async function recallTx(id: number): Promise<{ tx_create?: string; tx_resolve?: string }> {
   if (!kv) return {};
   const [c, r] = await Promise.all([
-    kv.get<string>(["tx", id, "create"]),
-    kv.get<string>(["tx", id, "resolve"]),
+    kv.get<string>([...KV_NS, "tx", id, "create"]),
+    kv.get<string>([...KV_NS, "tx", id, "resolve"]),
   ]);
   return { tx_create: c.value ?? undefined, tx_resolve: r.value ?? undefined };
 }
