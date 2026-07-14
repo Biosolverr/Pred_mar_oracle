@@ -104,7 +104,7 @@ async function glRead(fn: string, args: unknown[]): Promise<any> {
   });
 }
 
-async function glWrite(fn: string, args: unknown[]): Promise<{ txHash: string; receipt: any }> {
+async function glWrite(fn: string, args: unknown[]): Promise<{ txHash: string; receipt: any; confirmed: boolean }> {
   if (!writeClient) throw new Error("GenLayer write account failed to initialize on the server — check logs");
   const txHash = await writeClient.writeContract({
     address: GL_CONTRACT as `0x${string}`,
@@ -112,8 +112,24 @@ async function glWrite(fn: string, args: unknown[]): Promise<{ txHash: string; r
     args,
     value: 0n,
   });
-  const receipt = await writeClient.waitForTransactionReceipt({ hash: txHash, status: "ACCEPTED" });
-  return { txHash, receipt };
+  try {
+    const receipt = await writeClient.waitForTransactionReceipt({
+      hash: txHash,
+      status: "ACCEPTED",
+      // Studio validator consensus can be slow, especially right after
+      // a fresh contract redeploy — the SDK default was too tight and
+      // threw a hard timeout even though the tx usually still landed.
+      timeout: 60_000,
+    } as any);
+    return { txHash, receipt, confirmed: true };
+  } catch (e) {
+    // Timed out waiting, but the tx was already submitted — don't
+    // treat this as a failure. Caller gets the hash either way and
+    // can decide what to tell the user (e.g. "submitted, still
+    // confirming" instead of a hard error that invites a risky retry).
+    console.error(`waitForTransactionReceipt timed out for ${txHash} (${fn}):`, (e as Error).message);
+    return { txHash, receipt: null, confirmed: false };
+  }
 }
 
 // On-demand finality check — separate from the main write path so
@@ -696,7 +712,10 @@ async function placeBet(){
     const r=await fetch('/api/markets/'+id+'/bet',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({position:selectedPos,amount:parseFloat($('b-amount').value)||0.1})});
     const d=await r.json();
-    if(d.success){setMsg('b-msg','✅ Bet: '+selectedPos+' on #'+id+' — '+txLink(d.tx_hash),true);showToast('Bet placed');loadList();loadLogs();if(currentMarketId==id)inspectMarket(id);}
+    if(d.success){
+      const suffix=d.confirmed===false?' ⏳ '+(d.note||'still confirming'):'';
+      setMsg('b-msg','✅ Bet: '+selectedPos+' on #'+id+' — '+txLink(d.tx_hash)+suffix,true);
+      showToast(d.confirmed===false?'Bet submitted, confirming...':'Bet placed');loadList();loadLogs();if(currentMarketId==id)inspectMarket(id);}
     else{setMsg('b-msg','❌ '+(d.error||'Failed'),false);showToast(d.error||'Failed','err');}
   }catch(e){setMsg('b-msg','❌ '+e.message,false);}
   btn.disabled=false;btn.textContent='Place Bet on GenLayer';
@@ -709,8 +728,9 @@ async function doResolve(id, msgTarget, btn){
     const r=await fetch('/api/markets/'+id+'/resolve',{method:'POST'});
     const d=await r.json();
     if(d.success){
-      setMsg(msgTarget,'✅ Consensus: '+d.consensus+' — '+txLink(d.tx_hash),true);
-      showToast('Resolved: '+d.consensus);loadList();loadStats();loadLogs();
+      const suffix=d.confirmed===false?' ⏳ '+(d.note||'still confirming'):'';
+      setMsg(msgTarget,'✅ Consensus: '+d.consensus+' — '+txLink(d.tx_hash)+suffix,true);
+      showToast(d.confirmed===false?'Submitted, confirming...':'Resolved: '+d.consensus);loadList();loadStats();loadLogs();
       setTimeout(()=>inspectMarket(id),300);
     }else{setMsg(msgTarget,'❌ '+(d.error||'Failed'),false);showToast(d.error||'Failed','err');}
   }catch(e){setMsg(msgTarget,'❌ '+e.message,false);}
@@ -980,10 +1000,15 @@ Deno.serve(async (req) => {
       const amount   = Math.max(0.000001, parseFloat(b.amount) || 0.1);
       const amountUnits = toBaseUnits(amount);
 
-      const { txHash } = await glWrite(GL_METHOD_PLACE_BET, [id, position, amountUnits]);
-      await addLog("bet_placed_onchain", { market_id: id, position, amount, tx: txHash });
+      const { txHash, confirmed } = await glWrite(GL_METHOD_PLACE_BET, [id, position, amountUnits]);
+      await addLog("bet_placed_onchain", { market_id: id, position, amount, tx: txHash, confirmed });
 
-      return json({ success: true, tx_hash: txHash });
+      return json({
+        success: true,
+        tx_hash: txHash,
+        confirmed,
+        note: confirmed ? undefined : "Submitted, but still confirming on-chain — check back in a bit before retrying.",
+      });
     } catch (e) {
       return json({ success: false, error: (e as Error).message }, 500);
     }
@@ -1019,17 +1044,19 @@ Deno.serve(async (req) => {
       // Runs the contract's own multi-agent consensus (CoinGecko +
       // Binance + LLM Oracle, gl.eq_principle.prompt_comparative)
       // inside GenVM across validators — nothing computed here.
-      const { txHash } = await glWrite(GL_METHOD_RESOLVE, [id]);
+      const { txHash, confirmed } = await glWrite(GL_METHOD_RESOLVE, [id]);
       await rememberTx(id, "resolve", txHash);
 
       const raw = await glGetMarketRaw(id);
       const market = normalizeMarket(id, raw);
 
-      await addLog("resolution_onchain", { id, tx: txHash, consensus: market?.consensus });
+      await addLog("resolution_onchain", { id, tx: txHash, consensus: market?.consensus, confirmed });
 
       return json({
         success: true,
         tx_hash: txHash,
+        confirmed,
+        note: confirmed ? undefined : "Submitted, but still confirming on-chain — the consensus below may not be final yet. Check back shortly.",
         consensus: market?.consensus ?? null,
         agent_votes: market?.agent_votes ?? [],
       });
