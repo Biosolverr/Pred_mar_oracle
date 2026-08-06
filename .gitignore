@@ -1,21 +1,5 @@
-# Environment
-.env
-.env.local
-.env.*.local
+node_modules/
+.vercel/
+__pycache__/
+*.pyc
 
-# Deno cache
-.deno/
-deno.lock
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Editor
-.vscode/settings.json
-.idea/
-*.swp
-*.swo
-
-# Logs
-*.log
