@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GenLayer Prediction Market — Bradbury Testnet</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          bg: '#0b0d12',
+          panel: '#12151c',
+          panel2: '#171b24',
+          border: '#242938',
+          accent: '#7c5cff',
+          accent2: '#3ddc97',
+          bad: '#ff5c7a',
+          warn: '#ffb95c',
+        }
+      }
+    }
+  }
+</script>
+<style>
+  body { background: #0b0d12; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #242938; border-radius: 4px; }
+  .skeleton { background: linear-gradient(90deg,#171b24 25%,#1d2230 37%,#171b24 63%); background-size: 400% 100%; animation: sk 1.4s ease infinite; }
+  @keyframes sk { 0%{background-position:100% 50%} 100%{background-position:0 50%} }
+  .toast-enter { animation: slideIn .2s ease-out; }
+  @keyframes slideIn { from{transform:translateX(20px);opacity:0} to{transform:translateX(0);opacity:1} }
+</style>
+</head>
+<body class="text-gray-200 font-sans min-h-screen">
+
+<div id="toasts" class="fixed top-4 right-4 z-50 flex flex-col gap-2 w-80"></div>
+
+<!-- HEADER -->
+<header class="border-b border-border sticky top-0 bg-bg/90 backdrop-blur z-40">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-accent to-accent2 flex items-center justify-center font-bold text-black">G</div>
+      <div>
+        <div class="font-semibold leading-none">GenLayer Predict</div>
+        <div class="text-[11px] text-gray-500 leading-none mt-0.5">Bradbury Testnet</div>
+      </div>
+    </div>
+    <div class="flex-1 max-w-md hidden md:block">
+      <input id="searchInput" placeholder="Search markets…" class="w-full bg-panel border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent" />
+    </div>
+    <div id="walletArea" class="flex items-center gap-2"></div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 py-6">
+
+  <!-- PROTOCOL STATS -->
+  <section id="statsSection" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"></section>
+
+  <!-- FILTERS -->
+  <section class="flex flex-wrap items-center gap-2 mb-4">
+    <div id="filterChips" class="flex flex-wrap gap-2"></div>
+    <div class="flex-1"></div>
+    <select id="sortSelect" class="bg-panel border border-border rounded-lg px-2 py-1.5 text-sm">
+      <option value="newest">Newest</option>
+      <option value="ending">Ending Soon</option>
+      <option value="pool">Largest Pool</option>
+    </select>
+    <button id="createMarketBtn" class="bg-accent hover:bg-accent/80 text-white text-sm font-medium px-3 py-1.5 rounded-lg">+ New Market</button>
+  </section>
+
+  <!-- MARKET GRID -->
+  <section id="marketGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-10"></section>
+
+  <!-- PROTOCOL ACTIVITY -->
+  <section class="mb-10">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-lg font-semibold">Protocol Activity</h2>
+      <button id="refreshActivity" class="text-xs text-gray-400 hover:text-white">↻ Refresh</button>
+    </div>
+    <div id="activityFeed" class="space-y-2"></div>
+  </section>
+
+</main>
+
+<footer class="border-t border-border mt-10">
+  <div class="max-w-7xl mx-auto px-4 py-6 text-sm text-gray-500 flex flex-wrap gap-4 justify-between">
+    <span>Experimental testnet software — not audited. See SECURITY.md.</span>
+    <div class="flex gap-4">
+      <a id="footerContract" href="#" target="_blank" class="hover:text-white">Contract</a>
+      <a href="https://explorer-bradbury.genlayer.com" target="_blank" class="hover:text-white">Explorer</a>
+      <a href="https://docs.genlayer.com" target="_blank" class="hover:text-white">GenLayer Docs</a>
+      <a href="https://github.com" target="_blank" class="hover:text-white">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+<!-- MARKET DETAIL / CREATE MODAL ROOT -->
+<div id="modalRoot"></div>
+
+<script type="module">
+import { createClient, createAccount } from 'https://esm.sh/genlayer-js@latest';
+import { testnetBradbury } from 'https://esm.sh/genlayer-js@latest/chains';
+import { TransactionStatus } from 'https://esm.sh/genlayer-js@latest/types';
+
+// ---------------------------------------------------------------------
+// CONFIG
+// ---------------------------------------------------------------------
+const CONFIG = {
+  // Fill in after deployment (see deploy/ and README).
+  contractAddress: window.__PREDICTION_MARKET_ADDRESS__ || '0xYOUR_DEPLOYED_CONTRACT_ADDRESS',
+  explorerBase: 'https://explorer-bradbury.genlayer.com',
+  faucetUrl: 'https://testnet-faucet.genlayer.foundation',
+  chainIdHex: '0x' + (4221).toString(16),
+};
+
+document.getElementById('footerContract').href =
+  `${CONFIG.explorerBase}/address/${CONFIG.contractAddress}`;
+
+const WEI = 10n ** 18n;
+const fmtGen = (wei) => {
+  try {
+    const v = typeof wei === 'bigint' ? wei : BigInt(wei ?? 0);
+    const whole = v / WEI;
+    const frac = (v % WEI).toString().padStart(18, '0').slice(0, 3);
+    return `${whole}.${frac}`;
+  } catch { return '0.000'; }
+};
+const toWei = (genStr) => {
+  const [w, f = ''] = String(genStr).split('.');
+  const frac = (f + '000000000000000000').slice(0, 18);
+  return BigInt(w || '0') * WEI + BigInt(frac || '0');
+};
+
+// ---------------------------------------------------------------------
+// TOASTS
+// ---------------------------------------------------------------------
+function toast(msg, kind = 'info', ms = 5000) {
+  const el = document.createElement('div');
+  const colors = { info: 'border-accent', success: 'border-accent2', error: 'border-bad', warn: 'border-warn' };
+  el.className = `toast-enter bg-panel border ${colors[kind] || colors.info} rounded-lg px-3 py-2 text-sm shadow-lg`;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+
+// ---------------------------------------------------------------------
+// CLIENTS — read client needs no wallet; write client is wallet-signed.
+// ---------------------------------------------------------------------
+const readClient = createClient({ chain: testnetBradbury });
+let writeClient = null;
+let account = null; // connected address
+
+async function ensureWallet() {
+  if (!window.ethereum) {
+    toast('MetaMask (or another injected wallet) was not found.', 'error');
+    return false;
+  }
+  return true;
+}
+
+async function connectWallet() {
+  if (!(await ensureWallet())) return;
+  try {
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    account = accounts[0];
+    writeClient = createClient({ chain: testnetBradbury, account, provider: window.ethereum });
+    // Make sure the wallet is actually on Bradbury before any write.
+    await writeClient.connect('testnetBradbury').catch(() => {});
+    window.ethereum.on?.('accountsChanged', (accs) => { account = accs[0]; renderWallet(); refreshAll(); });
+    window.ethereum.on?.('chainChanged', () => { renderWallet(); });
+    toast('Wallet connected', 'success');
+    renderWallet();
+    refreshAll();
+  } catch (e) {
+    toast('Wallet connection rejected: ' + (e?.message || e), 'error');
+  }
+}
+
+async function currentChainOk() {
+  if (!window.ethereum) return false;
+  const chainId = await window.ethereum.request({ method: 'eth_chainId' });
+  return chainId === CONFIG.chainIdHex;
+}
+
+async function getGenBalance(addr) {
+  try {
+    const bal = await window.ethereum.request({ method: 'eth_getBalance', params: [addr, 'latest'] });
+    return BigInt(bal);
+  } catch { return 0n; }
+}
+
+async function renderWallet() {
+  const area = document.getElementById('walletArea');
+  if (!account) {
+    area.innerHTML = `<button id="connectBtn" class="bg-accent hover:bg-accent/80 text-white text-sm font-medium px-3 py-2 rounded-lg">Connect Wallet</button>`;
+    document.getElementById('connectBtn').onclick = connectWallet;
+    return;
+  }
+  const ok = await currentChainOk();
+  const bal = await getGenBalance(account);
+  area.innerHTML = `
+    <div class="flex items-center gap-2 text-sm">
+      <span class="px-2 py-1 rounded-md ${ok ? 'bg-accent2/10 text-accent2' : 'bg-bad/10 text-bad'} border ${ok ? 'border-accent2/30' : 'border-bad/30'}">
+        ${ok ? 'Bradbury ✓' : 'Wrong network'}
+      </span>
+      <span class="text-gray-400">${fmtGen(bal)} GEN</span>
+      <span class="font-mono bg-panel border border-border rounded-md px-2 py-1">${account.slice(0,6)}…${account.slice(-4)}</span>
+    </div>`;
+  if (!ok) {
+    area.querySelector('span').onclick = () => writeClient?.connect('testnetBradbury');
+  }
+}
+
+// ---------------------------------------------------------------------
+// TRANSACTION TRACKING
+// ---------------------------------------------------------------------
+async function trackTx(hash, label) {
+  toast(`${label}: submitted`, 'info');
+  try {
+    const receipt = await readClient.waitForTransactionReceipt({
+      hash,
+      status: TransactionStatus.ACCEPTED,
+    });
+    if (receipt.txExecutionResultName && receipt.txExecutionResultName !== 'FINISHED_WITH_RETURN' && receipt.txExecutionResultName !== 0) {
+      // fall through — still show accepted state, error surfaced below
+    }
+    toast(`${label}: accepted — finalizing…`, 'success');
+    readClient.waitForTransactionReceipt({ hash, status: TransactionStatus.FINALIZED })
+      .then(() => { toast(`${label}: finalized ✓`, 'success'); refreshAll(); })
+      .catch(() => {});
+    return receipt;
+  } catch (e) {
+    toast(`${label}: failed or undetermined — ${e?.message || e}`, 'error');
+    throw e;
+  }
+}
+
+function explorerTxLink(hash) {
+  return `${CONFIG.explorerBase}/tx/${hash}`;
+}
+
+// ---------------------------------------------------------------------
+// CONTRACT CALLS
+// ---------------------------------------------------------------------
+async function readContract(functionName, args = []) {
+  return readClient.readContract({ address: CONFIG.contractAddress, functionName, args });
+}
+
+async function writeContract(functionName, args = [], value = 0n, label = functionName) {
+  if (!account) { toast('Connect your wallet first', 'warn'); return; }
+  if (!(await currentChainOk())) {
+    toast('Switching wallet to Bradbury…', 'warn');
+    await writeClient.connect('testnetBradbury');
+  }
+  const hash = await writeClient.writeContract({
+    address: CONFIG.contractAddress,
+    functionName,
+    args,
+    value,
+  });
+  return trackTx(hash, label);
+}
+
+// ---------------------------------------------------------------------
+// DATA LOADING
+// ---------------------------------------------------------------------
+let allMarkets = [];
+let currentFilter = 'all';
+let currentSort = 'newest';
+let searchTerm = '';
+
+async function loadMarkets() {
+  const countRaw = await readContract('get_market_count').catch(() => 0);
+  const count = Number(countRaw || 0);
+  const ids = Array.from({ length: count }, (_, i) => i);
+  const markets = await Promise.all(ids.map(async (id) => {
+    try {
+      const m = await readContract('get_market', [id]);
+      return normalizeMarket(m, id);
+    } catch { return null; }
+  }));
+  allMarkets = markets.filter(Boolean).reverse();
+  renderStats();
+  renderFilters();
+  renderMarketGrid();
+}
+
+function normalizeMarket(m, id) {
+  return {
+    id,
+    creator: m.creator,
+    question: m.question,
+    description: m.description,
+    category: m.category,
+    resolution_source: m.resolution_source,
+    resolution_criteria: m.resolution_criteria,
+    bettingDeadline: Number(m.betting_deadline),
+    resolutionEligibleAt: Number(m.resolution_eligible_at),
+    createdAt: Number(m.created_at),
+    status: m.status,
+    outcome: m.outcome,
+    creatorBond: BigInt(m.creator_bond),
+    bondClaimed: !!m.bond_claimed,
+    yesPool: BigInt(m.yes_pool),
+    noPool: BigInt(m.no_pool),
+    feeCollected: BigInt(m.fee_collected),
+    bettorCount: Number(m.bettor_count),
+    resolutionEvidence: m.resolution_evidence,
+    resolutionReason: m.resolution_reason,
+    resolvedAt: Number(m.resolved_at),
+  };
+}
+
+function deriveDisplayStatus(m) {
+  const now = Math.floor(Date.now() / 1000);
+  if (m.status === 'RESOLVED') return 'RESOLVED';
+  if (m.status === 'INVALID') return 'INVALID';
+  if (now >= m.resolutionEligibleAt) return 'RESOLVING';
+  if (now >= m.bettingDeadline) return 'BETTING_CLOSED';
+  return 'OPEN';
+}
+
+// ---------------------------------------------------------------------
+// STATS
+// ---------------------------------------------------------------------
+async function renderStats() {
+  const total = allMarkets.length;
+  const open = allMarkets.filter(m => deriveDisplayStatus(m) === 'OPEN').length;
+  const resolved = allMarkets.filter(m => m.status === 'RESOLVED').length;
+  const totalVolume = allMarkets.reduce((s, m) => s + m.yesPool + m.noPool + m.feeCollected, 0n);
+  const tvl = allMarkets
+    .filter(m => m.status === 'OPEN')
+    .reduce((s, m) => s + m.yesPool + m.noPool + m.creatorBond, 0n);
+  const treasury = await readContract('get_treasury_balance').catch(() => 0n);
+
+  const cards = [
+    ['Total Markets', total],
+    ['Open Markets', open],
+    ['Resolved', resolved],
+    ['Total Volume', fmtGen(totalVolume) + ' GEN'],
+    ['TVL', fmtGen(tvl) + ' GEN'],
+    ['Protocol Treasury', fmtGen(treasury) + ' GEN'],
+  ];
+  document.getElementById('statsSection').innerHTML = cards.map(([label, val]) => `
+    <div class="bg-panel border border-border rounded-xl px-4 py-3">
+      <div class="text-[11px] uppercase tracking-wide text-gray-500">${label}</div>
+      <div class="text-lg font-semibold mt-1">${val}</div>
+    </div>`).join('');
+}
+
+// ---------------------------------------------------------------------
+// FILTERS / GRID
+// ---------------------------------------------------------------------
+const FILTERS = ['All', 'Open', 'Closing Soon', 'Resolving', 'Resolved', 'Invalid', 'My Bets', 'My Markets'];
+
+function renderFilters() {
+  const el = document.getElementById('filterChips');
+  el.innerHTML = FILTERS.map(f => {
+    const key = f.toLowerCase().replace(/\s/g, '-');
+    const active = currentFilter === key;
+    return `<button data-f="${key}" class="text-xs px-3 py-1.5 rounded-full border ${active ? 'bg-accent border-accent text-white' : 'border-border text-gray-400 hover:text-white'}">${f}</button>`;
+  }).join('');
+  el.querySelectorAll('button').forEach(b => b.onclick = () => { currentFilter = b.dataset.f; renderFilters(); renderMarketGrid(); });
+}
+
+function statusBadge(status) {
+  const map = {
+    OPEN: 'bg-accent2/10 text-accent2 border-accent2/30',
+    BETTING_CLOSED: 'bg-warn/10 text-warn border-warn/30',
+    RESOLVING: 'bg-warn/10 text-warn border-warn/30',
+    RESOLVED: 'bg-accent/10 text-accent border-accent/30',
+    INVALID: 'bg-bad/10 text-bad border-bad/30',
+  };
+  return `<span class="text-[11px] px-2 py-0.5 rounded-full border ${map[status] || map.OPEN}">${status}</span>`;
+}
+
+function timeLeft(ts) {
+  const s = ts - Math.floor(Date.now() / 1000);
+  if (s <= 0) return 'closed';
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function renderMarketGrid() {
+  let list = [...allMarkets];
+  const now = Math.floor(Date.now() / 1000);
+
+  if (searchTerm) {
+    const t = searchTerm.toLowerCase();
+    list = list.filter(m => m.question.toLowerCase().includes(t) || m.category.toLowerCase().includes(t));
+  }
+
+  switch (currentFilter) {
+    case 'open': list = list.filter(m => deriveDisplayStatus(m) === 'OPEN'); break;
+    case 'closing-soon': list = list.filter(m => deriveDisplayStatus(m) === 'OPEN' && (m.bettingDeadline - now) < 3600); break;
+    case 'resolving': list = list.filter(m => deriveDisplayStatus(m) === 'RESOLVING'); break;
+    case 'resolved': list = list.filter(m => m.status === 'RESOLVED'); break;
+    case 'invalid': list = list.filter(m => m.status === 'INVALID'); break;
+    case 'my-bets': list = list.filter(m => m.__hasMyBet); break; // populated async, see below
+    case 'my-markets': list = list.filter(m => account && m.creator?.toLowerCase() === account.toLowerCase()); break;
+  }
+
+  if (currentSort === 'newest') list.sort((a, b) => b.createdAt - a.createdAt);
+  if (currentSort === 'ending') list.sort((a, b) => a.bettingDeadline - b.bettingDeadline);
+  if (currentSort === 'pool') list.sort((a, b) => Number((b.yesPool + b.noPool) - (a.yesPool + a.noPool)));
+
+  const grid = document.getElementById('marketGrid');
+  if (!list.length) {
+    grid.innerHTML = `<div class="col-span-full text-center text-gray-500 py-16">No markets match this filter yet.</div>`;
+    return;
+  }
+
+  grid.innerHTML = list.map(m => {
+    const total = m.yesPool + m.noPool;
+    const yesPct = total > 0n ? Number((m.yesPool * 100n) / total) : 50;
+    const status = deriveDisplayStatus(m);
+    return `
+    <div data-id="${m.id}" class="market-card bg-panel border border-border rounded-xl p-4 hover:border-accent/50 cursor-pointer transition">
+      <div class="flex items-start justify-between gap-2 mb-2">
+        <span class="text-[11px] text-gray-500">${m.category || 'General'}</span>
+        ${statusBadge(status)}
+      </div>
+      <div class="font-medium text-sm mb-3 line-clamp-2">${escapeHtml(m.question)}</div>
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-accent2">YES ${yesPct}%</span>
+        <span class="text-bad">NO ${100 - yesPct}%</span>
+      </div>
+      <div class="w-full h-1.5 bg-panel2 rounded-full overflow-hidden mb-3">
+        <div class="h-full bg-accent2" style="width:${yesPct}%"></div>
+      </div>
+      <div class="flex justify-between text-xs text-gray-400">
+        <span>Pool: ${fmtGen(total)} GEN</span>
+        <span>${status === 'OPEN' ? 'Closes in ' + timeLeft(m.bettingDeadline) : ''}</span>
+      </div>
+      <div class="text-[11px] text-gray-600 mt-2 font-mono">Creator ${short(m.creator)}</div>
+    </div>`;
+  }).join('');
+
+  grid.querySelectorAll('.market-card').forEach(card => {
+    card.onclick = () => openMarketDetail(Number(card.dataset.id));
+  });
+}
+
+function short(addr) { return addr ? `${addr.slice(0,6)}…${addr.slice(-4)}` : ''; }
+function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+
+document.getElementById('searchInput').addEventListener('input', (e) => { searchTerm = e.target.value; renderMarketGrid(); });
+document.getElementById('sortSelect').addEventListener('change', (e) => { currentSort = e.target.value; renderMarketGrid(); });
+
+// ---------------------------------------------------------------------
+// MARKET DETAIL MODAL
+// ---------------------------------------------------------------------
+async function openMarketDetail(id) {
+  const m = allMarkets.find(x => x.id === id);
+  if (!m) return;
+  const status = deriveDisplayStatus(m);
+  const total = m.yesPool + m.noPool;
+  const yesPct = total > 0n ? Number((m.yesPool * 100n) / total) : 50;
+  const feeBps = Number(await readContract('get_fee_bps').catch(() => 100));
+
+  let myBet = { yes_gross: 0n, no_gross: 0n, yes_net: 0n, no_net: 0n, claimed: false };
+  if (account) {
+    try {
+      const b = await readContract('get_user_bet', [id, account]);
+      myBet = {
+        yes_gross: BigInt(b.yes_gross), no_gross: BigInt(b.no_gross),
+        yes_net: BigInt(b.yes_net), no_net: BigInt(b.no_net), claimed: !!b.claimed,
+      };
+    } catch {}
+  }
+
+  const root = document.getElementById('modalRoot');
+  root.innerHTML = `
+  <div class="fixed inset-0 bg-black/70 z-50 flex items-start md:items-center justify-center p-4 overflow-y-auto" id="modalBackdrop">
+    <div class="bg-panel border border-border rounded-2xl max-w-3xl w-full my-8" id="modalBox">
+      <div class="p-5 border-b border-border flex justify-between items-start gap-4">
+        <div>
+          <div class="text-[11px] text-gray-500 mb-1">${m.category || 'General'} · ${statusBadge(status)}</div>
+          <h2 class="text-lg font-semibold">${escapeHtml(m.question)}</h2>
+        </div>
+        <button id="closeModal" class="text-gray-500 hover:text-white text-xl leading-none">×</button>
+      </div>
+
+      <div class="px-5 pt-4 flex gap-4 border-b border-border text-sm" id="tabBar">
+        ${['Overview','Bets','Resolution','Activity'].map((t,i)=>`<button data-tab="${t}" class="tab-btn pb-3 border-b-2 ${i===0?'border-accent text-white':'border-transparent text-gray-500'}">${t}</button>`).join('')}
+      </div>
+
+      <div class="p-5" id="tabContent"></div>
+    </div>
+  </div>`;
+
+  document.getElementById('closeModal').onclick = () => root.innerHTML = '';
+  document.getElementById('modalBackdrop').onclick = (e) => { if (e.target.id === 'modalBackdrop') root.innerHTML = ''; };
+
+  const tabBtns = root.querySelectorAll('.tab-btn');
+  tabBtns.forEach(btn => btn.onclick = () => {
+    tabBtns.forEach(b => b.className = 'tab-btn pb-3 border-b-2 border-transparent text-gray-500');
+    btn.className = 'tab-btn pb-3 border-b-2 border-accent text-white';
+    renderTab(btn.dataset.tab);
+  });
+
+  function renderTab(tab) {
+    const content = document.getElementById('tabContent');
+    if (tab === 'Overview') content.innerHTML = overviewTab();
+    if (tab === 'Bets') content.innerHTML = betsTab();
+    if (tab === 'Resolution') content.innerHTML = resolutionTab();
+    if (tab === 'Activity') content.innerHTML = `<div class="text-sm text-gray-500">Loading…</div>`, loadMarketActivity();
+    wireTabHandlers(tab);
+  }
+
+  function overviewTab() {
+    return `
+      <p class="text-sm text-gray-400 mb-4">${escapeHtml(m.description || 'No description provided.')}</p>
+      <div class="grid grid-cols-2 gap-3 text-xs text-gray-400 mb-4">
+        <div>Betting closes<br><span class="text-white">${new Date(m.bettingDeadline*1000).toLocaleString()}</span></div>
+        <div>Resolution eligible<br><span class="text-white">${new Date(m.resolutionEligibleAt*1000).toLocaleString()}</span></div>
+        <div>Creator Bond<br><span class="text-white">${fmtGen(m.creatorBond)} GEN</span></div>
+        <div>Platform Fee<br><span class="text-white">${(feeBps/100).toFixed(2)}%</span></div>
+      </div>
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-accent2">YES ${yesPct}% · ${fmtGen(m.yesPool)} GEN</span>
+        <span class="text-bad">NO ${100-yesPct}% · ${fmtGen(m.noPool)} GEN</span>
+      </div>
+      <div class="w-full h-2 bg-panel2 rounded-full overflow-hidden mb-1">
+        <div class="h-full bg-accent2" style="width:${yesPct}%"></div>
+      </div>
+      <div class="text-[11px] text-gray-600 mb-4">Pool distribution — not a guaranteed real-world probability.</div>
+
+      ${lifecycleTimeline(m, status)}
+
+      ${status === 'OPEN' ? bettingForm() : ''}
+      ${status === 'RESOLVING' ? `<button id="resolveBtn" class="w-full bg-accent hover:bg-accent/80 text-white rounded-lg py-2.5 font-medium mt-2">Resolve Market</button>` : ''}
+      ${status === 'BETTING_CLOSED' ? `<div class="text-center text-sm text-gray-500 py-3 border border-border rounded-lg">Betting closed — resolution available ${new Date(m.resolutionEligibleAt*1000).toLocaleString()}</div>` : ''}
+      ${claimSection()}
+    `;
+  }
+
+  function lifecycleTimeline(m, status) {
+    const steps = ['Market Created','Betting Open','Betting Closed','Resolution Available','Resolved','Claimable'];
+    const order = { OPEN: 2, BETTING_CLOSED: 3, RESOLVING: 4, RESOLVED: 5, INVALID: 5 };
+    const reached = order[status] ?? 2;
+    return `<div class="flex flex-wrap gap-2 mb-4 text-[11px]">
+      ${steps.map((s,i) => `<span class="px-2 py-1 rounded-full border ${i < reached ? 'border-accent2/40 text-accent2' : 'border-border text-gray-600'}">${i < reached ? '✓' : '○'} ${s}</span>`).join('')}
+    </div>`;
+  }
+
+  function bettingForm() {
+    return `
+    <div class="border border-border rounded-lg p-4 mt-2">
+      <div class="flex gap-2 mb-3">
+        <button id="sideYes" class="flex-1 py-2 rounded-lg border border-accent2/40 text-accent2 bg-accent2/5 font-medium text-sm side-btn" data-side="YES">YES</button>
+        <button id="sideNo" class="flex-1 py-2 rounded-lg border border-border text-gray-400 font-medium text-sm side-btn" data-side="NO">NO</button>
+      </div>
+      <input id="betAmount" type="number" min="0" step="0.01" placeholder="Amount in GEN" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2 text-sm mb-2 focus:outline-none focus:border-accent" />
+      <div id="payoutPreview" class="text-xs text-gray-500 mb-3">Estimated payout: —</div>
+      <button id="placeBetBtn" class="w-full bg-accent hover:bg-accent/80 text-white rounded-lg py-2.5 font-medium text-sm">Confirm Bet</button>
+      <div class="text-[11px] text-gray-600 mt-2">Estimated payout only — additional bets can change the pool before betting closes. Bets are public on-chain before the deadline.</div>
+    </div>`;
+  }
+
+  function claimSection() {
+    if (!account) return '';
+    if (status === 'RESOLVED' && (myBet.yes_net > 0n || myBet.no_net > 0n)) {
+      const won = (m.outcome === 'YES' && myBet.yes_net > 0n) || (m.outcome === 'NO' && myBet.no_net > 0n);
+      if (!won) return `<div class="mt-3 text-sm text-gray-500">Your bet did not win this market.</div>`;
+      if (myBet.claimed) return `<div class="mt-3 text-sm text-accent2">✓ Winnings Claimed</div>`;
+      const winningNet = m.outcome === 'YES' ? myBet.yes_net : myBet.no_net;
+      const winnerPool = m.outcome === 'YES' ? m.yesPool : m.noPool;
+      const payout = winnerPool > 0n ? (winningNet * (m.yesPool + m.noPool)) / winnerPool : 0n;
+      return `<div class="mt-3 border border-accent2/30 bg-accent2/5 rounded-lg p-3">
+        <div class="text-sm text-accent2 font-medium mb-2">You won +${fmtGen(payout)} GEN</div>
+        <button id="claimWinBtn" class="w-full bg-accent2 text-black font-medium rounded-lg py-2 text-sm">Claim Winnings</button>
+      </div>`;
+    }
+    if (status === 'INVALID' && (myBet.yes_gross > 0n || myBet.no_gross > 0n)) {
+      if (myBet.claimed) return `<div class="mt-3 text-sm text-accent2">✓ Refund Claimed</div>`;
+      const refund = myBet.yes_gross + myBet.no_gross;
+      return `<div class="mt-3 border border-warn/30 bg-warn/5 rounded-lg p-3">
+        <div class="text-sm text-warn font-medium mb-2">Market invalid — refund available: ${fmtGen(refund)} GEN</div>
+        <button id="claimRefundBtn" class="w-full bg-warn text-black font-medium rounded-lg py-2 text-sm">Claim Refund</button>
+      </div>`;
+    }
+    if ((status === 'RESOLVED' || status === 'INVALID') && account.toLowerCase() === (m.creator||'').toLowerCase() && !m.bondClaimed) {
+      return `<div class="mt-3 border border-border rounded-lg p-3">
+        <div class="text-sm mb-2">Creator bond: ${fmtGen(m.creatorBond)} GEN</div>
+        <button id="claimBondBtn" class="w-full bg-panel2 border border-border rounded-lg py-2 text-sm">Claim Creator Bond</button>
+      </div>`;
+    }
+    return '';
+  }
+
+  function betsTab() {
+    return `
+      <div class="text-sm space-y-2">
+        <div class="flex justify-between"><span class="text-gray-500">Your YES stake</span><span>${fmtGen(myBet.yes_gross)} GEN</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Your NO stake</span><span>${fmtGen(myBet.no_gross)} GEN</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Claim status</span><span>${myBet.claimed ? 'Claimed' : (myBet.yes_gross+myBet.no_gross>0n ? 'Pending' : '—')}</span></div>
+      </div>
+      ${!account ? `<div class="text-xs text-gray-500 mt-3">Connect your wallet to see your bets.</div>` : ''}
+    `;
+  }
+
+  function resolutionTab() {
+    return `
+      <div class="text-sm space-y-3">
+        <div><span class="text-gray-500">Resolution source</span><br><a href="${escapeHtml(m.resolution_source)}" target="_blank" class="text-accent break-all">${escapeHtml(m.resolution_source)}</a></div>
+        <div><span class="text-gray-500">Resolution criteria</span><br>${escapeHtml(m.resolution_criteria)}</div>
+        ${m.status !== 'OPEN' ? `
+          <div><span class="text-gray-500">Result</span><br><span class="font-medium">${m.outcome}</span></div>
+          <div><span class="text-gray-500">Evidence</span><br>${escapeHtml(m.resolutionEvidence || '—')}</div>
+          <div><span class="text-gray-500">Reason</span><br>${escapeHtml(m.resolutionReason || '—')}</div>
+          <div class="text-xs text-gray-600 pt-2 border-t border-border">Consensus secured by GenLayer Optimistic Democracy.</div>
+        ` : `<div class="text-xs text-gray-500">Not yet resolved.</div>`}
+      </div>`;
+  }
+
+  async function loadMarketActivity() {
+    const events = await readContract('get_recent_activity', [500]).catch(() => []);
+    const mine = events.filter(e => Number(e.market_id) === id).reverse();
+    const content = document.getElementById('tabContent');
+    if (!content) return;
+    if (!mine.length) { content.innerHTML = `<div class="text-sm text-gray-500">No activity yet.</div>`; return; }
+    content.innerHTML = `<div class="space-y-2">${mine.map(e => `
+      <div class="flex justify-between text-xs border border-border rounded-lg px-3 py-2">
+        <span>${e.kind.replace(/_/g,' ')}</span>
+        <span class="text-gray-500">${e.note ? escapeHtml(e.note) + ' · ' : ''}${e.amount>0? fmtGen(e.amount)+' GEN · ':''}${new Date(Number(e.ts)*1000).toLocaleString()}</span>
+      </div>`).join('')}</div>`;
+  }
+
+  function wireTabHandlers(tab) {
+    if (tab !== 'Overview') return;
+
+    document.querySelectorAll('.side-btn')?.forEach(b => b.onclick = () => {
+      document.querySelectorAll('.side-btn').forEach(x => x.className = 'flex-1 py-2 rounded-lg border border-border text-gray-400 font-medium text-sm side-btn');
+      b.className = b.dataset.side === 'YES'
+        ? 'flex-1 py-2 rounded-lg border border-accent2/40 text-accent2 bg-accent2/5 font-medium text-sm side-btn selected'
+        : 'flex-1 py-2 rounded-lg border border-bad/40 text-bad bg-bad/5 font-medium text-sm side-btn selected';
+    });
+
+    const amountInput = document.getElementById('betAmount');
+    amountInput?.addEventListener('input', () => {
+      const val = parseFloat(amountInput.value || '0');
+      if (!val) { document.getElementById('payoutPreview').textContent = 'Estimated payout: —'; return; }
+      const side = document.querySelector('.side-btn.selected')?.dataset.side || 'YES';
+      const amountWei = toWei(amountInput.value || '0');
+      const fee = (amountWei * BigInt(feeBps)) / 10000n;
+      const net = amountWei - fee;
+      const newYes = m.yesPool + (side === 'YES' ? net : 0n);
+      const newNo = m.noPool + (side === 'NO' ? net : 0n);
+      const newTotal = newYes + newNo;
+      const myShareOfWinning = side === 'YES' ? newYes : newNo;
+      const est = myShareOfWinning > 0n ? (net * newTotal) / myShareOfWinning : net;
+      document.getElementById('payoutPreview').innerHTML =
+        `Fee ${(feeBps/100).toFixed(2)}% · Net stake ${fmtGen(net)} GEN · Estimated payout <span class="text-accent2">${fmtGen(est)} GEN</span>`;
+    });
+
+    document.getElementById('placeBetBtn')?.addEventListener('click', async () => {
+      const side = document.querySelector('.side-btn.selected')?.dataset.side || 'YES';
+      const amountInput = document.getElementById('betAmount');
+      const val = amountInput.value;
+      if (!val || parseFloat(val) <= 0) return toast('Enter a bet amount', 'warn');
+      try {
+        await writeContract('place_bet', [id, side], toWei(val), 'Place bet');
+        root.innerHTML = '';
+      } catch (e) { /* toasted already */ }
+    });
+
+    document.getElementById('resolveBtn')?.addEventListener('click', async () => {
+      try {
+        await writeContract('trigger_resolution', [id], 0n, 'Trigger resolution');
+        root.innerHTML = '';
+      } catch (e) {}
+    });
+
+    document.getElementById('claimWinBtn')?.addEventListener('click', async () => {
+      try { await writeContract('claim_winnings', [id], 0n, 'Claim winnings'); root.innerHTML=''; } catch(e){}
+    });
+    document.getElementById('claimRefundBtn')?.addEventListener('click', async () => {
+      try { await writeContract('claim_refund', [id], 0n, 'Claim refund'); root.innerHTML=''; } catch(e){}
+    });
+    document.getElementById('claimBondBtn')?.addEventListener('click', async () => {
+      try { await writeContract('claim_creator_bond', [id], 0n, 'Claim creator bond'); root.innerHTML=''; } catch(e){}
+    });
+  }
+
+  renderTab('Overview');
+}
+
+// ---------------------------------------------------------------------
+// CREATE MARKET MODAL
+// ---------------------------------------------------------------------
+document.getElementById('createMarketBtn').onclick = () => {
+  if (!account) return toast('Connect your wallet first', 'warn');
+  const root = document.getElementById('modalRoot');
+  root.innerHTML = `
+  <div class="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4 overflow-y-auto" id="createBackdrop">
+    <div class="bg-panel border border-border rounded-2xl max-w-lg w-full p-5">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-lg font-semibold">New Prediction Market</h2>
+        <button id="closeCreate" class="text-gray-500 hover:text-white text-xl leading-none">×</button>
+      </div>
+      <div class="space-y-3 text-sm">
+        <input id="q" placeholder="Question (min 15 chars)" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
+        <textarea id="desc" placeholder="Description" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2 h-20"></textarea>
+        <input id="cat" placeholder="Category (e.g. Crypto)" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
+        <input id="src" placeholder="Resolution source URL" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
+        <textarea id="crit" placeholder="Resolution criteria — be precise, e.g. 'According to [source], will X be true at [time]?'" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2 h-16"></textarea>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-xs text-gray-500">Betting closes</label>
+            <input id="deadline" type="datetime-local" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">Resolution eligible</label>
+            <input id="elig" type="datetime-local" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500">Creator Bond (GEN, min 10)</label>
+          <input id="bond" type="number" min="10" value="10" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
+        </div>
+        <div class="text-[11px] text-gray-600">Market rules are immutable after creation.</div>
+        <button id="submitCreate" class="w-full bg-accent hover:bg-accent/80 text-white rounded-lg py-2.5 font-medium">Create Market</button>
+      </div>
+    </div>
+  </div>`;
+  document.getElementById('closeCreate').onclick = () => root.innerHTML = '';
+  document.getElementById('createBackdrop').onclick = (e) => { if (e.target.id === 'createBackdrop') root.innerHTML = ''; };
+  document.getElementById('submitCreate').onclick = async () => {
+    const q = document.getElementById('q').value.trim();
+    const desc = document.getElementById('desc').value.trim();
+    const cat = document.getElementById('cat').value.trim();
+    const src = document.getElementById('src').value.trim();
+    const crit = document.getElementById('crit').value.trim();
+    const deadline = document.getElementById('deadline').value;
+    const elig = document.getElementById('elig').value;
+    const bond = document.getElementById('bond').value;
+    if (!q || q.length < 15) return toast('Question must be at least 15 characters', 'warn');
+    if (!src || !crit) return toast('Resolution source and criteria are required', 'warn');
+    if (!deadline || !elig) return toast('Set both deadlines', 'warn');
+    const deadlineTs = Math.floor(new Date(deadline).getTime() / 1000);
+    const eligTs = Math.floor(new Date(elig).getTime() / 1000);
+    try {
+      await writeContract('create_market',
+        [q, desc, cat, src, crit, deadlineTs, eligTs],
+        toWei(bond || '10'), 'Create market');
+      root.innerHTML = '';
+    } catch (e) {}
+  };
+};
+
+// ---------------------------------------------------------------------
+// PROTOCOL ACTIVITY FEED
+// ---------------------------------------------------------------------
+async function renderActivityFeed() {
+  const events = await readContract('get_recent_activity', [30]).catch(() => []);
+  const el = document.getElementById('activityFeed');
+  if (!events.length) { el.innerHTML = `<div class="text-sm text-gray-500">No activity yet.</div>`; return; }
+  const icons = { MARKET_CREATED: '🟢', BET_PLACED: '🔵', MARKET_RESOLVED: '🟣', WINNINGS_CLAIMED: '🟡', REFUND_CLAIMED: '🟠', BOND_RETURNED: '⚪', TREASURY_WITHDRAWAL: '🔴' };
+  el.innerHTML = events.reverse().map(e => `
+    <div class="flex items-center justify-between bg-panel border border-border rounded-lg px-4 py-2.5 text-sm">
+      <div class="flex items-center gap-2">
+        <span>${icons[e.kind] || '⚫'}</span>
+        <span>${e.kind.replace(/_/g,' ')}</span>
+        <span class="text-gray-500">market #${e.market_id}</span>
+      </div>
+      <div class="flex items-center gap-3 text-xs text-gray-500">
+        ${e.amount > 0 ? `<span>${fmtGen(e.amount)} GEN</span>` : ''}
+        <span class="font-mono">${short(e.actor)}</span>
+        <span>${new Date(Number(e.ts)*1000).toLocaleTimeString()}</span>
+      </div>
+    </div>`).join('');
+}
+document.getElementById('refreshActivity').onclick = renderActivityFeed;
+
+// ---------------------------------------------------------------------
+// INIT
+// ---------------------------------------------------------------------
+async function refreshAll() {
+  await loadMarkets();
+  await renderActivityFeed();
+}
+
+(async function init() {
+  renderFilters();
+  renderWallet();
+  if (window.ethereum) {
+    try {
+      const accounts = await window.ethereum.request({ method: 'eth_accounts' });
+      if (accounts[0]) { account = accounts[0]; writeClient = createClient({ chain: testnetBradbury, account, provider: window.ethereum }); renderWallet(); }
+    } catch {}
+  }
+  await refreshAll();
+  setInterval(() => { if (!document.hidden) refreshAll(); }, 30000);
+})();
+</script>
+</body>
+</html>
