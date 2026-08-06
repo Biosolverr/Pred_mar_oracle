@@ -579,10 +579,15 @@ non-equivalent — free-text phrasing is expected to vary between models.
         return self.owner
 
     @gl.public.view
-    def get_recent_activity(self, limit: int) -> DynArray[ActivityEvent]:
-        out: DynArray[ActivityEvent] = DynArray[ActivityEvent]()
+    def get_recent_activity(self, limit: int) -> list[ActivityEvent]:
+        # DynArray can only be declared as a storage field, not
+        # instantiated ad-hoc inside a method body (that raised
+        # "TypeError: this class can't be instantiated by user" on
+        # Bradbury) — a plain Python list is the correct return type
+        # for a transient, non-persisted value like this.
         n = len(self.activity)
         start = max(0, n - max(0, min(limit, n)))
+        out = []
         for i in range(start, n):
             out.append(self.activity[i])
         return out
