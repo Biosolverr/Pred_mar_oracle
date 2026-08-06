@@ -696,8 +696,10 @@ async function openMarketDetail(id) {
 // ---------------------------------------------------------------------
 // CREATE MARKET MODAL
 // ---------------------------------------------------------------------
-document.getElementById('createMarketBtn').onclick = () => {
+document.getElementById('createMarketBtn').onclick = async () => {
   if (!account) return toast('Connect your wallet first', 'warn');
+  const minBondWei = await readContract('get_min_bond').catch(() => 0n);
+  const minBondGen = fmtGen(minBondWei);
   const root = document.getElementById('modalRoot');
   root.innerHTML = `
   <div class="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4 overflow-y-auto" id="createBackdrop">
@@ -723,14 +725,20 @@ document.getElementById('createMarketBtn').onclick = () => {
           </div>
         </div>
         <div>
-          <label class="text-xs text-gray-500">Creator Bond (GEN, min 10)</label>
-          <input id="bond" type="number" min="10" value="10" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
+          <label class="text-xs text-gray-500" id="bondLabel">Creator Bond (GEN, min …)</label>
+          <input id="bond" type="number" min="0" value="" class="w-full bg-panel2 border border-border rounded-lg px-3 py-2" />
         </div>
         <div class="text-[11px] text-gray-600">Market rules are immutable after creation.</div>
         <button id="submitCreate" class="w-full bg-accent hover:bg-accent/80 text-white rounded-lg py-2.5 font-medium">Create Market</button>
       </div>
     </div>
   </div>`;
+  document.getElementById('bondLabel').textContent = `Creator Bond (GEN, min ${minBondGen})`;
+  const bondInput = document.getElementById('bond');
+  bondInput.min = minBondGen;
+  bondInput.value = minBondGen;
+  bondInput.placeholder = minBondGen;
+
   document.getElementById('closeCreate').onclick = () => root.innerHTML = '';
   document.getElementById('createBackdrop').onclick = (e) => { if (e.target.id === 'createBackdrop') root.innerHTML = ''; };
   document.getElementById('submitCreate').onclick = async () => {
@@ -750,7 +758,7 @@ document.getElementById('createMarketBtn').onclick = () => {
     try {
       await writeContract('create_market',
         [q, desc, cat, src, crit, deadlineTs, eligTs],
-        toWei(bond || '10'), 'Create market');
+        toWei(bond || minBondGen), 'Create market');
       root.innerHTML = '';
     } catch (e) {}
   };
